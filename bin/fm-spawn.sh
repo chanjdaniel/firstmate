@@ -635,22 +635,29 @@ fi
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
+# Check whether candidate dir is a genuine isolated git worktree distinct from
+# project_dir. Returns 0 (true) when every guard passes; 1 otherwise.
+is_isolated_worktree() {  # <candidate> <project_dir>
+  local cand=$1 proj=$2
+  local cand_real proj_real cand_top cand_top_real
+  cand_real=$(cd "$cand" 2>/dev/null && pwd -P) || cand_real=""
+  [ -n "$cand_real" ] || return 1
+  proj_real=$(cd "$proj" 2>/dev/null && pwd -P) || proj_real=""
+  cand_top=$(git -C "$cand" rev-parse --show-toplevel 2>/dev/null || true)
+  [ -n "$cand_top" ] || return 1
+  cand_top_real=$(cd "$cand_top" 2>/dev/null && pwd -P) || cand_top_real=""
+  [ -n "$cand_top_real" ] || return 1
+  # Must be the worktree root itself (not a subdirectory) and distinct from project.
+  [ "$cand_real" = "$cand_top_real" ] || return 1
+  [ "$cand_real" != "$proj_real" ] || return 1
+  return 0
+}
+
 validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
-  wt_real=
-  if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
-    wt_real=
-  fi
-  proj_real=
-  if ! proj_real=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P); then
-    proj_real=
-  fi
-  wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
-  wt_top_real=
-  if ! wt_top_real=$(cd "$wt_top" 2>/dev/null && pwd -P); then
-    wt_top_real=
-  fi
-  if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
+  local source=$1 inspect_target=$2
+  if ! is_isolated_worktree "$WT" "$PROJ_ABS"; then
+    local wt_top
+    wt_top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null || true)
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
@@ -788,17 +795,19 @@ spawn_send_key() {  # <target> <key>
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   spawn_send_text_line "$T" 'treehouse get'
 
-  # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
+  # Wait for the treehouse subshell: the pane's cwd moves from the project to the
+  # worktree. Only accept a genuine isolated worktree, not a transient pre-chdir
+  # state (e.g. the tmux server default $HOME right after new-window).
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$T" || true)
-    if [ -n "$p" ] && [ "$p" != "$PROJ_ABS" ]; then
+    if [ -n "$p" ] && is_isolated_worktree "$p" "$PROJ_ABS"; then
       WT="$p"
       break
     fi
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    echo "error: treehouse get did not yield an isolated worktree within 60s; inspect window $T" >&2
     exit 1
   fi
 
