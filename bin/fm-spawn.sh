@@ -640,12 +640,12 @@ fi
 is_isolated_worktree() {  # <candidate> <project_dir>
   local cand=$1 proj=$2
   local cand_real proj_real cand_top cand_top_real
-  cand_real=$(cd "$cand" 2>/dev/null && pwd -P || true)
+  cand_real=$(cd "$cand" 2>/dev/null && pwd -P) || cand_real=""
   [ -n "$cand_real" ] || return 1
-  proj_real=$(cd "$proj" 2>/dev/null && pwd -P || true)
+  proj_real=$(cd "$proj" 2>/dev/null && pwd -P) || proj_real=""
   cand_top=$(git -C "$cand" rev-parse --show-toplevel 2>/dev/null || true)
   [ -n "$cand_top" ] || return 1
-  cand_top_real=$(cd "$cand_top" 2>/dev/null && pwd -P || true)
+  cand_top_real=$(cd "$cand_top" 2>/dev/null && pwd -P) || cand_top_real=""
   [ -n "$cand_top_real" ] || return 1
   # Must be the worktree root itself (not a subdirectory) and distinct from project.
   [ "$cand_real" = "$cand_top_real" ] || return 1
