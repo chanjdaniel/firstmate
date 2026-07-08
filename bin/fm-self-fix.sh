@@ -34,4 +34,4 @@ echo "self-fix worktree: $WT (branch $BRANCH off $DEFAULT_BRANCH)"
 
 # fm-spawn --worktree skips treehouse and uses this pre-created isolated worktree
 # (running its own isolation assertion). Forwarded args carry --harness/--model/--effort.
-exec "$FM_ROOT/bin/fm-spawn.sh" "$ID" "$FM_ROOT" --worktree "$WT" "$@"
+exec "$FM_ROOT/bin/fm-spawn.sh" "$ID" "$FM_ROOT" --worktree "$WT" --backend tmux "$@"

@@ -161,6 +161,10 @@ if [ "$BACKEND_SET" -eq 1 ]; then
 else
   BACKEND=$(fm_backend_name)
 fi
+if [ -n "$SELFFIX_WT" ] && [ "$BACKEND" != tmux ]; then
+  echo "error: self-fix (--worktree) is only supported on the tmux backend" >&2
+  exit 1
+fi
 fm_backend_validate_spawn "$BACKEND" || exit 1
 fm_backend_source "$BACKEND" || exit 1
 if [ "$BACKEND" = orca ] && [ "$KIND" = secondmate ]; then
