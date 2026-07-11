@@ -202,3 +202,5 @@ Contributions are welcome - see [CONTRIBUTING.md](CONTRIBUTING.md) for the workf
 ## License
 
 MIT - see [LICENSE](LICENSE).
+
+<!-- pr-target verification probe; this branch/PR will be closed -->
