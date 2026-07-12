@@ -111,6 +111,27 @@ The classifier deliberately reports `unknown` for `node`/`python`/`python3` rath
 Practical effect: a dead `pi` secondmate is not auto-healed by the liveness sweep today; it is reported as `skipped: liveness probe inconclusive` instead, which still surfaces it for a human to act on.
 Resolving this would need either a `pi`-specific env marker inspectable from outside the process (mirroring `PI_CODING_AGENT=true`, which `bin/fm-harness.sh` already uses for self-detection but which is not readable from a different process without deeper introspection) or accepting the argument-inspection fragility - not attempted here.
 
+## Worktree-path discovery: a bad `display-message` target falls back to the active window
+
+tmux is a session provider only, so [treehouse](https://github.com/kunchenguid/treehouse) still owns the worktree: `bin/fm-spawn.sh` runs `treehouse get` inside the new window and then polls that pane's cwd through `fm_backend_tmux_current_path` until it moves off the project clone.
+
+The finding that shapes the adapter: `tmux display-message -p -t <target> '#{pane_current_path}'` does not fail when `<target>` does not resolve.
+It silently falls back to the ACTIVE client's window, prints that pane's path, and exits 0.
+For the discovery poll that is a dangerous answer rather than an error - if the target were lost, the poll could accept firstmate's own pane path (the active window, since firstmate is the one driving tmux) as the crewmate's worktree, and the task's `worktree=` meta, turn-end hook, and harness exclude-path lines would all be written into the primary checkout.
+
+Three defenses close that path, and they are independent on purpose:
+
+- **Target verification in the read itself.** `fm_backend_tmux_current_path` takes an optional second argument, the expected window id.
+  When it is supplied, the adapter reads `'#{window_id} #{pane_current_path}'` in ONE `display-message` call and checks that the window which answered is the window that was asked; a mismatch returns empty and exits non-zero instead of a plausible wrong path.
+  Called with one argument it behaves exactly as before, so callers that do not know a window id are unaffected.
+- **No target to lose.** `fm_backend_tmux_create_task` and `fm-spawn.sh` both treat an empty window id from `tmux new-window -dP -F '#{window_id}'` as fatal.
+  The adapter kills the just-created window first - it exists even when its id was not printed, and would otherwise trip the duplicate-name check when the same task id is retried - then fails.
+  The spawn aborts rather than degrading from the stable window id to the rename-fragile `<session>:<window-name>` target form.
+- **Repository identity as the backstop.** `fm-spawn.sh`'s `validate_spawn_worktree` requires the discovered worktree to belong to the project's own repository.
+  A path belonging to a different one - firstmate's own repo or home, or another clone - aborts the spawn loudly instead of being recorded (see [`architecture.md`](architecture.md), "Worktrees, not branches in your checkout").
+
+`tests/fm-tangle-guard.test.sh` pins all three hermetically: the two-field target verification against matching and mismatched window ids, the empty-window-id spawn abort, and the refusal of a worktree that resolves into firstmate's own repo while a pooled worktree of the project is still accepted.
+
 ## Limitations
 
 None specific to tmux for the reference path itself - it is the fully verified reference backend, while Orca and cmux are the backends without secondmate support.

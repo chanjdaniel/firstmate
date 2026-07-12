@@ -89,16 +89,40 @@ fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints 
     return 1
   fi
   wid=$(tmux new-window -dP -F '#{window_id}' -t "$ses:" -n "$wname" -c "$proj_abs") || return 1
+  if [ -z "$wid" ]; then
+    # new-window succeeded but printed no id: the window EXISTS and callers have
+    # only the name to reach it by, so kill it here before failing. Leaving it
+    # would make a retry of the same task id trip the duplicate-name check above.
+    tmux kill-window -t "$ses:$wname" 2>/dev/null || true
+    echo "error: tmux did not return a window id for $wname" >&2
+    return 1
+  fi
   tmux set-window-option -t "$wid" automatic-rename off 2>/dev/null || true
   tmux set-window-option -t "$wid" allow-rename off 2>/dev/null || true
   printf '%s\n' "$wid"
 }
 
 # fm_backend_tmux_current_path: the live pane's current working directory, or
-# empty on any tmux error. Mirrors fm-spawn.sh's worktree-discovery poll:
+# empty on any tmux error. Optional second arg <expected_window_id>: when
+# supplied reads both #{window_id} and #{pane_current_path} in one
+# display-message call and verifies the resolved window matches the expected
+# id - tmux silently falls back to the active client's window when the target
+# does not resolve, and this check turns that silent fallback into an explicit
+# failure (empty output, non-zero exit). Without the second arg the call is
+# unchanged from before for backward compatibility.
+# Mirrors fm-spawn.sh's worktree-discovery poll:
 # `tmux display-message -p -t "$T" '#{pane_current_path}'`.
-fm_backend_tmux_current_path() {  # <target>
-  tmux display-message -p -t "$1" '#{pane_current_path}' 2>/dev/null
+fm_backend_tmux_current_path() {  # <target> [<expected_window_id>]
+  local result resolved_id resolved_path
+  if [ -n "${2:-}" ]; then
+    result=$(tmux display-message -p -t "$1" '#{window_id} #{pane_current_path}' 2>/dev/null) || return 1
+    resolved_id=${result%% *}
+    resolved_path=${result#* }
+    [ "$resolved_id" = "$2" ] || return 1
+    printf '%s\n' "$resolved_path"
+  else
+    tmux display-message -p -t "$1" '#{pane_current_path}' 2>/dev/null
+  fi
 }
 
 # fm_backend_tmux_send_text_line: send one line of TEXT then Enter, with no

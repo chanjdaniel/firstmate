@@ -55,8 +55,8 @@
 #   provisioned firstmate home; the default is kind=ship.
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
-#   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   Ship/scout spawns refuse to launch unless the resolved task path is a real git worktree root
+#   of the PROJECT's own repository (not firstmate's repo/home or another clone), distinct from the primary checkout.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -84,7 +84,9 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the whole header comment block: lines 2 until the first non-comment line.
+  # Not a fixed line range, which silently truncates --help whenever the header grows.
+  sed -n '2,${/^#/!q;p;}' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -660,6 +662,20 @@ real_path_or_raw() {  # <path>
   fi
 }
 
+# git_common_dir_real: the physically-resolved shared git directory of <dir>'s
+# repository, or empty when <dir> is not inside a git repository. A clone and
+# every worktree of it - a treehouse pool worktree, an Orca worktree - share one
+# common dir, so it identifies the REPOSITORY independently of where on disk the
+# worktree happens to live.
+git_common_dir_real() {  # <dir>
+  local dir=$1 common real
+  common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
+  [ -n "$common" ] || return 0
+  # --git-common-dir can be relative to <dir> (plain ".git" in a clone).
+  real=$(cd "$dir" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P) || return 0
+  printf '%s\n' "$real"
+}
+
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -670,6 +686,7 @@ real_path_or_raw() {  # <path>
 # per-backend routing (fm_backend_resolve_selector).
 validate_spawn_worktree() {  # <source> <inspect-target>
   local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+  local wt_common proj_common fm_root_real fm_home_real where
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -682,6 +699,29 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
   if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    exit 1
+  fi
+  # Reject a worktree that belongs to a DIFFERENT repository than the project
+  # clone - firstmate's own repo (FM_ROOT), a secondmate home, or another clone.
+  # tmux's display-message silently falls back to the active window when a target
+  # does not resolve, so a lost or empty window id can cause the worktree-discovery
+  # poll to read firstmate's own pane path; this backstop turns that silent
+  # mis-record into a loud, safe spawn refusal. Repository identity, not path
+  # containment, is the test: a pooled worktree of the project is legitimate
+  # wherever it lives, including under the clone itself when treehouse.toml sets a
+  # repo-relative root (<clone>/.treehouse/<n>, inside FM_HOME by construction).
+  wt_common=$(git_common_dir_real "$WT")
+  proj_common=$(git_common_dir_real "$PROJ_ABS")
+  if [ -z "$wt_common" ] || [ -z "$proj_common" ] || [ "$wt_common" != "$proj_common" ]; then
+    fm_root_real=$(cd "$FM_ROOT" 2>/dev/null && pwd -P) || fm_root_real="$FM_ROOT"
+    fm_home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || fm_home_real="$FM_HOME"
+    where=
+    if [ "$wt_real" = "$fm_root_real" ] || path_is_ancestor_of "$fm_root_real" "$wt_real"; then
+      where=" at or inside firstmate's own repo ($fm_root_real)"
+    elif [ -n "$fm_home_real" ] && { [ "$wt_real" = "$fm_home_real" ] || path_is_ancestor_of "$fm_home_real" "$wt_real"; }; then
+      where=" at or inside firstmate's home ($fm_home_real)"
+    fi
+    echo "error: $source resolved to '$wt_real'$where, which is not a worktree of the project repository ($PROJ_ABS); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
 }
@@ -698,6 +738,10 @@ case "$BACKEND" in
     # rename-critical worktree-detection steps below; the persisted window= handle
     # stays $T (the name form), which is safe now that rename is disabled.
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    if [ -z "$WID" ]; then
+      echo "error: tmux did not return a window id for $W" >&2
+      exit 1
+    fi
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -802,9 +846,9 @@ spawn_send_text_line() {  # <target> <text>
     cmux) fm_backend_cmux_send_text_line "$1" "$2" "$W" ;;
   esac
 }
-spawn_current_path() {  # <target>
+spawn_current_path() {  # <target> [<expected_window_id>]
   case "$BACKEND" in
-    tmux) fm_backend_tmux_current_path "$1" ;;
+    tmux) fm_backend_tmux_current_path "$1" "${2:-}" ;;
     herdr) fm_backend_herdr_current_path "$1" ;;
     zellij) fm_backend_zellij_current_path "$1" "$W" ;;
     cmux) fm_backend_cmux_current_path "$1" "$W" ;;
@@ -840,7 +884,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # prefix would otherwise make the pane's OS-level cwd read differ from
   # PROJ_ABS on the very first poll, before the pane has actually moved.
   for _ in $(seq 1 60); do
-    p=$(spawn_current_path "$WT_TARGET" || true)
+    p=$(spawn_current_path "$WT_TARGET" "${WID:-}" || true)
     if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
       WT="$p"
       break

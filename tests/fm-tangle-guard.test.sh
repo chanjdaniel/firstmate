@@ -159,12 +159,20 @@ make_spawn_fakebin() {
 #!/usr/bin/env bash
 set -u
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{window_id} #{pane_current_path}"*)
+    printf '@fakewid %s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
+  *"#{pane_current_path}"*)
+    printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
+  new-window) printf '@fakewid\n'; exit 0 ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|send-keys) exit 0 ;;
+  has-session|new-session|send-keys|set-window-option) exit 0 ;;
 esac
 exit 0
 SH
@@ -237,7 +245,14 @@ make_spawn_record_fakebin() {
 set -u
 [ -n "${FM_TMUX_REC:-}" ] && printf 'tmux %s\n' "$*" >> "$FM_TMUX_REC"
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{window_id} #{pane_current_path}"*)
+    printf '@spawnwid %s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
+  *"#{pane_current_path}"*)
+    printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
@@ -295,10 +310,176 @@ test_spawn_tmux_window_construction() {
   # Bug 2 fix (b): treehouse-get and the worktree wait loop target the stable id.
   assert_grep "send-keys -t @spawnwid treehouse get Enter" "$rec" \
     "treehouse get must be sent to the stable window id"
-  assert_grep "display-message -p -t @spawnwid #{pane_current_path}" "$rec" \
-    "the worktree wait loop must query the stable window id, not the name"
+  assert_grep "display-message -p -t @spawnwid #{window_id} #{pane_current_path}" "$rec" \
+    "the worktree wait loop must query the stable window id (now with window_id verification), not the name"
 
   pass "fm-spawn: appends windows by session-colon, pins the name, and targets the window id"
+}
+
+# --- Fix: tmux path-read target verification ----------------------------------
+
+# The fm_backend_tmux_current_path function now accepts an optional
+# expected_window_id. When given, it reads both #{window_id} and
+# #{pane_current_path} in one display-message call and verifies the resolved
+# window matches. Without the second arg, behavior is unchanged (backward
+# compatible). This test runs in a subprocess with a fake tmux on PATH that
+# always reports window @0; mismatched expected ids must fail.
+test_tmux_path_read_target_verification() {
+  local dir fakebin
+  dir=$(fm_test_tmproot tmux-target-verify)
+  fakebin=$(fm_fakebin "$dir")
+
+  # Fake tmux: always returns @0 /home/user/wt for the two-field form, and
+  # /home/user/wt for the single-field (backward-compat) form.
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  *"#{window_id} #{pane_current_path}"*)
+    printf '@0 /home/user/wt\n'
+    exit 0
+    ;;
+  *"#{pane_current_path}"*)
+    printf '/home/user/wt\n'
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/tmux"
+
+  PATH="$fakebin:$PATH" FM_ROOT="$ROOT" FM_BACKEND_LIB_DIR="$ROOT/bin" bash -c '
+    . "$1/bin/fm-backend.sh" 2>/dev/null
+    fm_backend_source tmux 2>/dev/null || { echo "FAIL: source"; exit 99; }
+    out=$(fm_backend_tmux_current_path "@0" || true)
+    [ "$out" = "/home/user/wt" ] || { echo "FAIL: no-expected-id returned [$out]"; exit 1; }
+    out=$(fm_backend_tmux_current_path "@0" "@0" || true)
+    [ "$out" = "/home/user/wt" ] || { echo "FAIL: matching-id returned [$out]"; exit 1; }
+    if out=$(fm_backend_tmux_current_path "@9" "@9" 2>/dev/null); then
+      echo "FAIL: mismatched-id should fail (resolved @0, expected @9)"; exit 1
+    fi
+    echo "PASS"
+  ' _ "$ROOT" || fail "tmux path read target verification failed in subprocess"
+
+  pass "fm_backend_tmux_current_path: verifies resolved window id matches expected, fails on mismatch"
+}
+
+# --- Fix: empty WID aborts spawn ----------------------------------------------
+
+# A fake tmux whose new-window returns empty (simulating a tmux crash or
+# edge-case empty output that set -e does not catch) must cause fm-spawn to
+# abort with a clear error, never silently degrading WT_TARGET.
+make_spawn_emptywid_fakebin() {
+  local dir=$1 fakebin
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ -n "${FM_TMUX_REC:-}" ] && printf 'tmux %s\n' "$*" >> "$FM_TMUX_REC"
+case "$*" in
+  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+esac
+case "${1:-}" in
+  display-message) printf 'firstmate\n'; exit 0 ;;
+  new-window) exit 0 ;;   # succeeds but prints nothing (simulates empty WID)
+  list-windows) exit 0 ;;
+  has-session|new-session|send-keys|set-window-option|kill-window) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/tmux"
+  fm_fake_exit0 "$fakebin" treehouse
+  printf '%s\n' "$fakebin"
+}
+
+test_spawn_empty_wid_abort() {
+  local home proj fakebin out status wt rec
+  home="$TMP_ROOT/spawn-ew-home"
+  mkdir -p "$home/data/ew-abort-hh8"
+  printf 'brief\n' > "$home/data/ew-abort-hh8/brief.md"
+  proj=$(make_repo "$TMP_ROOT/spawn-ew-proj")
+  fakebin=$(make_spawn_emptywid_fakebin "$TMP_ROOT/spawn-ew-fake")
+  wt="$TMP_ROOT/spawn-ew-wt"
+  git -C "$proj" worktree add -q --detach "$wt" >/dev/null 2>&1
+  rec="$TMP_ROOT/spawn-ew-rec"
+  : > "$rec"
+
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" FM_TMUX_REC="$rec" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" ew-abort-hh8 "$proj" codex 2>&1); status=$?
+  expect_code 1 "$status" "spawn with empty WID should abort"
+  assert_contains "$out" "tmux did not return a window id" "empty-WID spawn did not report the clear error"
+  assert_absent "$home/state/ew-abort-hh8.meta" "aborted empty-WID spawn must not record meta"
+  # new-window already created the window, so the abort must not leak it: a
+  # retry of the same task id would otherwise trip the duplicate-name check.
+  assert_grep "kill-window -t firstmate:fm-ew-abort-hh8" "$rec" \
+    "the empty-WID abort must kill the orphan window it created"
+
+  pass "fm-spawn: aborts with clear error and kills the orphan window when tmux returns an empty window id"
+}
+
+# --- Fix: validate_spawn_worktree rejects foreign-repository worktrees --------
+
+# The backstop is REPOSITORY identity, not path containment: the discovered
+# worktree must share a git common dir with the project clone. That rejects
+# firstmate's own repo (FM_ROOT), firstmate's home (FM_HOME, e.g. a secondmate
+# home distinct from FM_ROOT), and any other clone, while still accepting a
+# legitimate pooled worktree of the project wherever it lives - including a
+# repo-relative treehouse pool under the clone itself, which sits INSIDE FM_HOME
+# by construction (projects live at $FM_HOME/projects/<name>).
+test_spawn_isolation_rejects_firstmate_paths() {
+  local home proj fakebin out status fm_root home_repo pooled pooled_wt
+  home="$TMP_ROOT/spawn-rej-home"
+  proj=$(make_repo "$TMP_ROOT/spawn-rej-proj")
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-rej-fake")
+  git -C "$proj" worktree add -q --detach "$TMP_ROOT/spawn-rej-wt" >/dev/null 2>&1
+  fm_root=$(cd "$ROOT" && pwd -P)
+  # A foreign clone living inside FM_HOME (FM_HOME != FM_ROOT here, as in a
+  # secondmate home): a git toplevel, but not a worktree of the project.
+  home_repo=$(make_repo "$home/projects/other-clone")
+  # The project's own pool worktree, placed under the clone the way a
+  # treehouse.toml with `root = "./"` places it - inside FM_HOME.
+  pooled=$(make_repo "$home/projects/pooled-proj")
+  pooled_wt="$pooled/.treehouse/1"
+  git -C "$pooled" worktree add -q --detach "$pooled_wt" >/dev/null 2>&1
+
+  # Helper: create brief and run spawn for a given id, project, and pane path.
+  rej_run() {
+    local id=$1 project=$2 pane=$3
+    mkdir -p "$home/data/$id"
+    printf 'brief\n' > "$home/data/$id/brief.md"
+    FM_ROOT_OVERRIDE="$fm_root" FM_HOME="$home" \
+      FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+      FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+      FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$pane" TMUX="fake,1,0" \
+      PATH="$fakebin:$PATH" \
+      "$ROOT/bin/fm-spawn.sh" "$id" "$project" codex 2>&1
+  }
+
+  # Reject: fake pane path resolves to FM_ROOT itself.
+  out=$(rej_run rej-root-ii9 "$proj" "$fm_root"); status=$?
+  expect_code 1 "$status" "spawn into FM_ROOT should abort"
+  assert_contains "$out" "at or inside firstmate's own repo" "FM_ROOT rejection lacked the isolation error"
+
+  # Reject: fake pane path resolves to another clone inside FM_HOME.
+  out=$(rej_run rej-home-jj0 "$proj" "$home_repo"); status=$?
+  expect_code 1 "$status" "spawn into a foreign repo inside FM_HOME should abort"
+  assert_contains "$out" "at or inside firstmate's home" "FM_HOME rejection lacked the isolation error"
+
+  # Accept: genuine isolated worktree (not inside FM_ROOT/FM_HOME).
+  out=$(rej_run ok-isolated-j1 "$proj" "$TMP_ROOT/spawn-rej-wt"); status=$?
+  expect_code 0 "$status" "spawn into a genuine isolated worktree should succeed"
+  assert_not_contains "$out" "not a worktree of the project repository" "isolated spawn wrongly tripped the guard"
+
+  # Accept: repo-relative pool worktree of the project, inside FM_HOME.
+  out=$(rej_run ok-pooled-k2 "$pooled" "$pooled_wt"); status=$?
+  expect_code 0 "$status" "spawn into the project's own repo-relative pool worktree should succeed"
+  assert_not_contains "$out" "not a worktree of the project repository" "repo-relative pool worktree wrongly refused"
+
+  pass "fm-spawn: validate_spawn_worktree rejects foreign-repo worktrees in FM_ROOT/FM_HOME and accepts pooled worktrees of the project"
 }
 
 test_lib_classification
@@ -307,3 +488,6 @@ test_bootstrap_line
 test_brief_assertion_precedes_branch
 test_spawn_isolation_abort
 test_spawn_tmux_window_construction
+test_tmux_path_read_target_verification
+test_spawn_empty_wid_abort
+test_spawn_isolation_rejects_firstmate_paths

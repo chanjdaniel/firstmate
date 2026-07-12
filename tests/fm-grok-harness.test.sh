@@ -16,12 +16,20 @@ make_spawn_fakebin() {
 #!/usr/bin/env bash
 set -u
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{window_id} #{pane_current_path}"*)
+    printf '@fakewid %s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
+  *"#{pane_current_path}"*)
+    printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
 esac
 case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|send-keys|kill-window) exit 0 ;;
+  new-window) printf '@fakewid\n'; exit 0 ;;
+  has-session|new-session|send-keys|kill-window) exit 0 ;;
 esac
 exit 0
 SH
