@@ -482,6 +482,99 @@ test_spawn_isolation_rejects_firstmate_paths() {
   pass "fm-spawn: validate_spawn_worktree rejects foreign-repo worktrees in FM_ROOT/FM_HOME and accepts pooled worktrees of the project"
 }
 
+# --- Fix: poll loop rejects transient non-worktree paths on first read ---------
+
+# A fake tmux that returns a bogus (non-worktree) path on the first poll read,
+# and the real worktree path from the second read onward. The window id is stable
+# (always @transientwid) so the PR #4 window-id verification passes - only the
+# repo-identity check in the poll loop can reject the bogus first read.
+make_spawn_transient_fakebin() {
+  local dir=$1 bogus_path=$2 wt=$3 fb="$1/fakebin" counter="$1/poll-count"
+  mkdir -p "$fb"
+  : > "$counter"
+  cat > "$fb/tmux" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-}" in
+  display-message)
+    for a in "\$@"; do case "\$a" in *"#{window_id} #{pane_current_path}"*)
+      printf x >> "$counter"
+      if [ "\$(wc -c < "$counter")" -le 1 ]; then
+        printf '@transientwid %s\\n' "$bogus_path"
+      else
+        printf '@transientwid %s\\n' "$wt"
+      fi
+      exit 0
+    ;; *pane_current_path*)
+      printf x >> "$counter"
+      if [ "\$(wc -c < "$counter")" -le 1 ]; then
+        printf '%s\\n' "$bogus_path"
+      else
+        printf '%s\\n' "$wt"
+      fi
+      exit 0
+    ;; esac; done
+    printf 'firstmate\\n'; exit 0 ;;
+  new-window) printf '@transientwid\\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+  has-session|new-session|send-keys|set-window-option) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux"
+  fm_fake_exit0 "$fb" treehouse
+  printf '%s\n' "$fb"
+}
+
+run_spawn_transient() {
+  local home=$1 id=$2 proj=$3 bogus=$4 fakebin=$5 panepath=$6
+  mkdir -p "$home/data/$id"
+  printf 'brief\n' > "$home/data/$id/brief.md"
+  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$panepath" TMUX="fake,1,0" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" codex 2>&1
+}
+
+test_spawn_poll_rejects_transient_cwd() {
+  local home proj wt bogus fakebin out status
+  home="$TMP_ROOT/spawn-transient-home"
+  mkdir -p "$home/data"
+  proj=$(make_repo "$TMP_ROOT/spawn-transient-proj")
+  wt="$TMP_ROOT/spawn-transient-wt"
+  git -C "$proj" worktree add -q --detach "$wt" >/dev/null 2>&1
+
+  # Case 1: first read is a non-git directory (e.g. a temp dir the shell briefly
+  # passed through). The repo-identity check rejects it because git_common_dir_real
+  # returns empty for a non-git path. The poll keeps going and accepts the real
+  # worktree on the second read.
+  bogus="$TMP_ROOT/spawn-transient-bogus1"
+  mkdir -p "$bogus"
+  fakebin=$(make_spawn_transient_fakebin "$TMP_ROOT/spawn-transient-fake1" "$bogus" "$wt")
+  out=$(run_spawn_transient "$home" transient-nongit-mm4 "$proj" "$bogus" "$fakebin" "$wt"); status=$?
+  expect_code 0 "$status" "spawn should succeed when the first poll read is a transient non-git path"$'\n'"$out"
+  assert_contains "$out" "spawned transient-nongit-mm4" "spawn did not report success for transient-nongit case"
+  assert_contains "$out" "worktree=$wt" "spawn recorded wrong worktree for transient-nongit case (expected $wt)"
+  assert_not_contains "$out" "did not yield an isolated worktree" "transient-nongit spawn wrongly tripped the isolation guard"
+
+  # Case 2: first read is firstmate's own repo root - the exact real-world bug.
+  # This path IS a git repo, but of a DIFFERENT repository than the project, so
+  # git_common_dir_real differs and the poll rejects it. The window id is stable
+  # the whole time (PR #4's guard passes), so only the repo-identity check catches
+  # this.
+  bogus=$(cd "$ROOT" && pwd -P)
+  fakebin=$(make_spawn_transient_fakebin "$TMP_ROOT/spawn-transient-fake2" "$bogus" "$wt")
+  out=$(run_spawn_transient "$home" transient-fmroot-nn5 "$proj" "$bogus" "$fakebin" "$wt"); status=$?
+  expect_code 0 "$status" "spawn should succeed when the first poll read is firstmate's own repo root"$'\n'"$out"
+  assert_contains "$out" "spawned transient-fmroot-nn5" "spawn did not report success for transient-fmroot case"
+  assert_contains "$out" "worktree=$wt" "spawn recorded wrong worktree for transient-fmroot case (expected $wt)"
+  assert_not_contains "$out" "not a worktree of the project repository" "transient-fmroot spawn wrongly tripped the isolation guard"
+
+  pass "fm-spawn: poll loop rejects a transient pre-chdir path (non-git or foreign-repo) on the first read, keeps polling, and accepts the real worktree"
+}
+
 test_lib_classification
 test_guard_banner
 test_bootstrap_line
@@ -491,3 +584,4 @@ test_spawn_tmux_window_construction
 test_tmux_path_read_target_verification
 test_spawn_empty_wid_abort
 test_spawn_isolation_rejects_firstmate_paths
+test_spawn_poll_rejects_transient_cwd

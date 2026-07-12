@@ -703,13 +703,27 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
   # Reject a worktree that belongs to a DIFFERENT repository than the project
   # clone - firstmate's own repo (FM_ROOT), a secondmate home, or another clone.
-  # tmux's display-message silently falls back to the active window when a target
-  # does not resolve, so a lost or empty window id can cause the worktree-discovery
-  # poll to read firstmate's own pane path; this backstop turns that silent
-  # mis-record into a loud, safe spawn refusal. Repository identity, not path
-  # containment, is the test: a pooled worktree of the project is legitimate
-  # wherever it lives, including under the clone itself when treehouse.toml sets a
-  # repo-relative root (<clone>/.treehouse/<n>, inside FM_HOME by construction).
+  # Repository identity, not path containment, is the test: a pooled worktree of
+  # the project is legitimate wherever it lives, including under the clone itself
+  # when treehouse.toml sets a repo-relative root (<clone>/.treehouse/<n>, inside
+  # FM_HOME by construction).
+  #
+  # Two known races can cause the worktree-discovery poll above to accept a bogus
+  # path. This backstop is defense-in-depth against both:
+  #
+  #   1. PR #4's race: tmux display-message -t <bad-name> silently falls back to
+  #      the active window, reading firstmate's own pane path. The poll's
+  #      window-id verification (spawn_current_path) catches this one, so it
+  #      should never reach this backstop. Still checked here.
+  #
+  #   2. The pre-chdir race: a freshly created tmux window reports the TMUX
+  #      SERVER's cwd on the first #{pane_current_path} read, BEFORE the shell
+  #      has chdir'd into the -c directory. The window id is CORRECT the whole
+  #      time (so race #1's guard is blind to this), and the path differs from
+  #      PROJ_ABS_REAL (so the old naive poll accepted it). The poll now uses
+  #      this same repo-identity check to reject transient pre-chdir reads, so
+  #      the loop keeps polling and this backstop should also never be reached
+  #      for this race. Still checked here as defense-in-depth.
   wt_common=$(git_common_dir_real "$WT")
   proj_common=$(git_common_dir_real "$PROJ_ABS")
   if [ -z "$wt_common" ] || [ -z "$proj_common" ] || [ "$wt_common" != "$proj_common" ]; then
@@ -883,11 +897,52 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
   # prefix would otherwise make the pane's OS-level cwd read differ from
   # PROJ_ABS on the very first poll, before the pane has actually moved.
+  #
+  # Two races make "differs from PROJ_ABS_REAL" insufficient as an acceptance test:
+  #   1. PR #4's race: tmux display-message -t <bad-name> silently falls back to
+  #      the active window, reading firstmate's own pane path. The window-id
+  #      verification in spawn_current_path catches this one.
+  #   2. The pre-chdir race: a freshly created window reports the TMUX SERVER's
+  #      cwd on the first #{pane_current_path} read, BEFORE the shell has chdir'd
+  #      into the -c directory. This path differs from PROJ_ABS_REAL (so the old
+  #      check passed), but it is NOT a worktree of the project - it is firstmate's
+  #      own repo root, or some other arbitrary path. The window id is CORRECT, so
+  #      race #1's guard does not catch this.
+  #
+  # Fix: accept a candidate path ONLY when it is a genuine git worktree of the
+  # SAME repository as the project clone (the same repo-identity predicate
+  # validate_spawn_worktree uses). A transient pre-chdir read fails that test,
+  # so the loop keeps polling instead of locking onto a bogus path.
+  proj_common_dir=$(git_common_dir_real "$PROJ_ABS")
+  prev_p=
   for _ in $(seq 1 60); do
     p=$(spawn_current_path "$WT_TARGET" "${WID:-}" || true)
     if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
-      WT="$p"
-      break
+      if [ -z "$proj_common_dir" ]; then
+        # Project is not inside a git repo - fall back to the simple
+        # path-diff test. validate_spawn_worktree will catch any tangle.
+        WT="$p"
+        break
+      fi
+      cand_common=$(git_common_dir_real "$p" || true)
+      if [ -n "$cand_common" ] && [ "$cand_common" = "$proj_common_dir" ]; then
+        # Candidate is a genuine worktree of the project repository.
+        WT="$p"
+        break
+      fi
+      # The candidate is not a worktree of the project. It could be:
+      #   a) A transient pre-chdir read (tmux server's cwd, firstmate's repo
+      #      root) that will change on the next poll. Keep polling.
+      #   b) A stable wrong path (permanent misconfiguration). Accept it after
+      #      one extra stable read and let validate_spawn_worktree produce the
+      #      error with diagnostic detail (path, FM_ROOT/FM_HOME proximity).
+      # The pre-chdir race resolves in well under a second, so two identical
+      # reads one second apart rules out case (a).
+      if [ -n "$prev_p" ] && [ "$p" = "$prev_p" ]; then
+        WT="$p"
+        break
+      fi
+      prev_p=$p
     fi
     sleep 1
   done

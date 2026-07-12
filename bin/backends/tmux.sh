@@ -110,6 +110,13 @@ fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints 
 # does not resolve, and this check turns that silent fallback into an explicit
 # failure (empty output, non-zero exit). Without the second arg the call is
 # unchanged from before for backward compatibility.
+#
+# The window-id verification catches one of two known races in the worktree-
+# discovery poll. The other - a freshly created window reporting the tmux
+# SERVER's cwd on the first #{pane_current_path} read before the shell has
+# chdir'd into -c - is NOT caught here (the window id is correct the whole
+# time). fm-spawn.sh's poll loop catches that with a repo-identity check.
+#
 # Mirrors fm-spawn.sh's worktree-discovery poll:
 # `tmux display-message -p -t "$T" '#{pane_current_path}'`.
 fm_backend_tmux_current_path() {  # <target> [<expected_window_id>]
