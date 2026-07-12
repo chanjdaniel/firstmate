@@ -95,10 +95,26 @@ fm_backend_tmux_create_task() {  # <session> <window-name> <proj-abs> -> prints 
 }
 
 # fm_backend_tmux_current_path: the live pane's current working directory, or
-# empty on any tmux error. Mirrors fm-spawn.sh's worktree-discovery poll:
+# empty on any tmux error. Optional second arg <expected_window_id>: when
+# supplied reads both #{window_id} and #{pane_current_path} in one
+# display-message call and verifies the resolved window matches the expected
+# id - tmux silently falls back to the active client's window when the target
+# does not resolve, and this check turns that silent fallback into an explicit
+# failure (empty output, non-zero exit). Without the second arg the call is
+# unchanged from before for backward compatibility.
+# Mirrors fm-spawn.sh's worktree-discovery poll:
 # `tmux display-message -p -t "$T" '#{pane_current_path}'`.
-fm_backend_tmux_current_path() {  # <target>
-  tmux display-message -p -t "$1" '#{pane_current_path}' 2>/dev/null
+fm_backend_tmux_current_path() {  # <target> [<expected_window_id>]
+  local result resolved_id resolved_path
+  if [ -n "${2:-}" ]; then
+    result=$(tmux display-message -p -t "$1" '#{window_id} #{pane_current_path}' 2>/dev/null) || return 1
+    resolved_id=${result%% *}
+    resolved_path=${result#* }
+    [ "$resolved_id" = "$2" ] || return 1
+    printf '%s\n' "$resolved_path"
+  else
+    tmux display-message -p -t "$1" '#{pane_current_path}' 2>/dev/null
+  fi
 }
 
 # fm_backend_tmux_send_text_line: send one line of TEXT then Enter, with no

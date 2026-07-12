@@ -669,7 +669,7 @@ real_path_or_raw() {  # <path>
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
 validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real fm_root_real fm_home_real
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -682,6 +682,21 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
   if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    exit 1
+  fi
+  # Reject worktrees at or inside firstmate's own repo (FM_ROOT) and home
+  # (FM_HOME). tmux's display-message silently falls back to the active window
+  # when a target does not resolve, so a lost or empty window id can cause the
+  # worktree-discovery poll to read firstmate's own pane path. This backstop
+  # turns that silent mis-record into a loud, safe spawn refusal.
+  fm_root_real=$(cd "$FM_ROOT" 2>/dev/null && pwd -P) || fm_root_real="$FM_ROOT"
+  if [ "$wt_real" = "$fm_root_real" ] || path_is_ancestor_of "$fm_root_real" "$wt_real"; then
+    echo "error: $source resolved to a worktree at or inside firstmate's own repo ($fm_root_real); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    exit 1
+  fi
+  fm_home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || fm_home_real="$FM_HOME"
+  if [ -n "$fm_home_real" ] && [ "$fm_home_real" != "$fm_root_real" ] && { [ "$wt_real" = "$fm_home_real" ] || path_is_ancestor_of "$fm_home_real" "$wt_real"; }; then
+    echo "error: $source resolved to a worktree at or inside firstmate's home ($fm_home_real); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
 }
@@ -698,6 +713,10 @@ case "$BACKEND" in
     # rename-critical worktree-detection steps below; the persisted window= handle
     # stays $T (the name form), which is safe now that rename is disabled.
     WID=$(fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS") || exit 1
+    if [ -z "$WID" ]; then
+      echo "error: tmux did not return a window id for $W" >&2
+      exit 1
+    fi
     WT_TARGET="$WID"
     ;;
   herdr)
@@ -802,9 +821,9 @@ spawn_send_text_line() {  # <target> <text>
     cmux) fm_backend_cmux_send_text_line "$1" "$2" "$W" ;;
   esac
 }
-spawn_current_path() {  # <target>
+spawn_current_path() {  # <target> [<expected_window_id>]
   case "$BACKEND" in
-    tmux) fm_backend_tmux_current_path "$1" ;;
+    tmux) fm_backend_tmux_current_path "$1" "${2:-}" ;;
     herdr) fm_backend_herdr_current_path "$1" ;;
     zellij) fm_backend_zellij_current_path "$1" "$W" ;;
     cmux) fm_backend_cmux_current_path "$1" "$W" ;;
@@ -840,7 +859,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # prefix would otherwise make the pane's OS-level cwd read differ from
   # PROJ_ABS on the very first poll, before the pane has actually moved.
   for _ in $(seq 1 60); do
-    p=$(spawn_current_path "$WT_TARGET" || true)
+    p=$(spawn_current_path "$WT_TARGET" "${WID:-}" || true)
     if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
       WT="$p"
       break
