@@ -111,26 +111,55 @@ The classifier deliberately reports `unknown` for `node`/`python`/`python3` rath
 Practical effect: a dead `pi` secondmate is not auto-healed by the liveness sweep today; it is reported as `skipped: liveness probe inconclusive` instead, which still surfaces it for a human to act on.
 Resolving this would need either a `pi`-specific env marker inspectable from outside the process (mirroring `PI_CODING_AGENT=true`, which `bin/fm-harness.sh` already uses for self-detection but which is not readable from a different process without deeper introspection) or accepting the argument-inspection fragility - not attempted here.
 
-## Worktree-path discovery: a bad `display-message` target falls back to the active window
+## Worktree-path discovery: two races, multiple defenses
 
 tmux is a session provider only, so [treehouse](https://github.com/kunchenguid/treehouse) still owns the worktree: `bin/fm-spawn.sh` runs `treehouse get` inside the new window and then polls that pane's cwd through `fm_backend_tmux_current_path` until it moves off the project clone.
 
-The finding that shapes the adapter: `tmux display-message -p -t <target> '#{pane_current_path}'` does not fail when `<target>` does not resolve.
+Two independent races can cause the discovery poll to read a bogus path:
+
+### Race 1: a bad `display-message` target falls back to the active window
+
+`tmux display-message -p -t <target> '#{pane_current_path}'` does not fail when `<target>` does not resolve.
 It silently falls back to the ACTIVE client's window, prints that pane's path, and exits 0.
 For the discovery poll that is a dangerous answer rather than an error - if the target were lost, the poll could accept firstmate's own pane path (the active window, since firstmate is the one driving tmux) as the crewmate's worktree, and the task's `worktree=` meta, turn-end hook, and harness exclude-path lines would all be written into the primary checkout.
 
-Three defenses close that path, and they are independent on purpose:
+### Race 2: a freshly created window reports the tmux server's cwd before its shell settles
 
-- **Target verification in the read itself.** `fm_backend_tmux_current_path` takes an optional second argument, the expected window id.
+`tmux new-window ... -c <project-dir>` creates a window whose shell will `chdir` into `<project-dir>`, but the window's first `#{pane_current_path}` read can report the TMUX SERVER's own cwd (firstmate's repo root) instead, before the shell has entered the `-c` directory.
+This path differs from `PROJ_ABS_REAL` (so a naive "has the pane left the project?" poll accepts it immediately), yet the window id is CORRECT the whole time (so race #1's window-id guard does not fire).
+Without further defenses the poll locks onto firstmate's own repo as the worktree, with all the same consequences.
+
+### Defenses
+
+Five defenses close both races, and they are independent on purpose:
+
+- **Target verification in the read itself** (race #1 only).
+  `fm_backend_tmux_current_path` takes an optional second argument, the expected window id.
   When it is supplied, the adapter reads `'#{window_id} #{pane_current_path}'` in ONE `display-message` call and checks that the window which answered is the window that was asked; a mismatch returns empty and exits non-zero instead of a plausible wrong path.
   Called with one argument it behaves exactly as before, so callers that do not know a window id are unaffected.
+  This catches race #1 but not race #2 (the window id is correct in both cases).
 - **No target to lose.** `fm_backend_tmux_create_task` and `fm-spawn.sh` both treat an empty window id from `tmux new-window -dP -F '#{window_id}'` as fatal.
   The adapter kills the just-created window first - it exists even when its id was not printed, and would otherwise trip the duplicate-name check when the same task id is retried - then fails.
   The spawn aborts rather than degrading from the stable window id to the rename-fragile `<session>:<window-name>` target form.
-- **Repository identity as the backstop.** `fm-spawn.sh`'s `validate_spawn_worktree` requires the discovered worktree to belong to the project's own repository.
+- **Repository identity in the poll itself** (race #2, and defense-in-depth for race #1).
+  Before accepting a candidate path, the poll loop verifies it is the ROOT of a git worktree belonging to the same repository as the project clone (`git rev-parse --git-common-dir` equality, anchored as below).
+  A transient pre-chdir path (the tmux server's cwd) is not a worktree root of the project, so the poll rejects it and keeps waiting.
+  There is no early-accept for a path that stays wrong: any such shortcut would need a timing assumption about how long the pre-chdir window lasts, which is exactly the assumption that produced race #2.
+  A permanently wrong path therefore just runs the poll budget out (60s by default; `FM_SPAWN_WORKTREE_TIMEOUT` overrides it with a positive integer number of seconds, and tests set it low to keep refusal cases fast), and the timeout error names the last candidate path and why it was rejected so the failure is diagnosable without a live pane.
+- **Repository identity is anchored at the working-tree root, on both sides of the comparison** (the condition that makes every identity check sound).
+  `git rev-parse` walks UP the tree, so a directory that is not a working-tree root of its own reports the identity of whatever repository ENCLOSES it.
+  `git_worktree_common_dir_real` reports an identity only when the directory it is asked about is itself the ROOT of a git working tree, and empty otherwise, which is what distinguishes "a different repository" from "no repository" and "somewhere inside a repository".
+  It anchors the check in both directions:
+    - The **project** side: projects live at `$FM_HOME/projects/<name>`, inside firstmate's own repo by construction, so a project directory that is not a git repo (an interrupted clone, a hand-made directory) would otherwise be handed firstmate's OWN repository identity, and a pre-chdir read of firstmate's repo root would then match "the project's repository" and sail through both the poll and the backstop.
+      Such a project has no identity at all, so nothing can be verified as a worktree of it; `fm-spawn.sh` refuses the spawn as a pre-flight check, before the backend creates the task window, naming the malformed project directory rather than blaming whatever path the pane happened to report.
+      Refusing before window creation also keeps the failure retryable: an abort after creation would strand an `fm-<id>` window that collides with the duplicate-name check when the repaired project is retried under the same task id.
+    - The **candidate** side: a pane path INSIDE the clone or one of its worktrees (a subdirectory the tmux server's cwd happened to sit in) would otherwise report the project's own repository, be accepted, and lock the poll onto a transient path - turning race #2 into a spurious isolation abort instead of a tangle, and failing every spawn for that project.
+      Only a worktree ROOT of the project's repository is accepted; anything below one keeps the loop polling and is named in the timeout diagnostic.
+- **Repository identity as the final backstop.** `fm-spawn.sh`'s `validate_spawn_worktree` requires the discovered worktree to belong to the project's own repository.
   A path belonging to a different one - firstmate's own repo or home, or another clone - aborts the spawn loudly instead of being recorded (see [`architecture.md`](architecture.md), "Worktrees, not branches in your checkout").
+  This is the safety net that caught race #2 before the poll-level fix; it now serves as defense-in-depth for both races.
 
-`tests/fm-tangle-guard.test.sh` pins all three hermetically: the two-field target verification against matching and mismatched window ids, the empty-window-id spawn abort, and the refusal of a worktree that resolves into firstmate's own repo while a pooled worktree of the project is still accepted.
+`tests/fm-tangle-guard.test.sh` pins the defenses hermetically: the two-field target verification against matching and mismatched window ids, the empty-window-id spawn abort, the refusal of a worktree that resolves into firstmate's own repo while a pooled worktree of the project is still accepted, the poll's rejection of a transient non-worktree path on the first read, and the refusal of a spawn whose non-repo project directory sits inside firstmate's own repo (the identity-inheritance case above, in the production `projects/`-inside-`FM_ROOT` layout).
 
 ## Limitations
 

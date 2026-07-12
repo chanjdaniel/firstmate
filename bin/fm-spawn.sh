@@ -57,6 +57,14 @@
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real git worktree root
 #   of the PROJECT's own repository (not firstmate's repo/home or another clone), distinct from the primary checkout.
+#   That also means the project directory must itself be a git working-tree root: a
+#   directory that is not a repository of its own has no repository identity to match,
+#   so no path can be verified as a worktree of it and the spawn is refused.
+# Env: FM_SPAWN_WORKTREE_TIMEOUT overrides the worktree-discovery poll budget, in whole
+#   seconds (default 60). It bounds how long a ship/scout spawn waits for the pane to
+#   land in a genuine worktree of the project. A value that is not a positive integer is
+#   rejected with a warning and the default is used. Tests set it low to keep refusal
+#   cases fast; there is no reason to set it in normal operation.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -667,6 +675,13 @@ real_path_or_raw() {  # <path>
 # every worktree of it - a treehouse pool worktree, an Orca worktree - share one
 # common dir, so it identifies the REPOSITORY independently of where on disk the
 # worktree happens to live.
+#
+# git's lookup walks UP the tree, so <dir> inherits the identity of whatever
+# repository ENCLOSES it when <dir> is not a repository of its own. That is safe
+# only for a candidate worktree path, which validate_spawn_worktree independently
+# requires to BE its own working-tree root. For any directory that is not already
+# known to be a working-tree root - the project directory above all - use
+# git_worktree_common_dir_real instead.
 git_common_dir_real() {  # <dir>
   local dir=$1 common real
   common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
@@ -675,6 +690,47 @@ git_common_dir_real() {  # <dir>
   real=$(cd "$dir" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P) || return 0
   printf '%s\n' "$real"
 }
+
+# git_worktree_common_dir_real: like git_common_dir_real, but reports an identity
+# ONLY when <dir> is itself the ROOT of a git working tree. Empty otherwise.
+#
+# The anchor is load-bearing, not defensive noise. Because git's lookup walks UP,
+# a project directory that is not a repository of its own (an interrupted clone, a
+# hand-made directory) reports the identity of the repository that encloses it -
+# and projects live at $FM_HOME/projects/<name>, INSIDE firstmate's own repo by
+# construction. An unanchored lookup therefore hands such a project firstmate's OWN
+# repository identity, and a pre-chdir read of firstmate's repo root then "matches
+# the project's repository", passing both the discovery poll and the
+# validate_spawn_worktree backstop and recording the primary checkout as the
+# crewmate's worktree - precisely the tangle those checks exist to prevent.
+# Anchoring at the working-tree root makes a non-repo directory report NO identity,
+# which is what distinguishes "a different repository" from "no repository".
+git_worktree_common_dir_real() {  # <dir>
+  local dir=$1 top top_real dir_real
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 0
+  [ -n "$top" ] || return 0
+  top_real=$(cd "$top" 2>/dev/null && pwd -P) || return 0
+  dir_real=$(cd "$dir" 2>/dev/null && pwd -P) || return 0
+  [ "$top_real" = "$dir_real" ] || return 0
+  git_common_dir_real "$dir"
+}
+
+# A project directory that is not a git working-tree root (an interrupted clone, a
+# hand-made directory) has no repository identity for a worktree to belong to, so
+# no path the worktree-discovery poll below could read can ever be valid. Refuse
+# up front, BEFORE the backend creates the task window: a refusal after creation
+# would leave an orphan window that makes a retry under the same task id collide
+# on the window name. Orca resolves its worktree from its own backend rather than
+# by polling a pane, and a secondmate's PROJ_ABS is a firstmate home, not a
+# project; both keep validate_spawn_worktree as their backstop.
+PROJ_COMMON_DIR=
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  PROJ_COMMON_DIR=$(git_worktree_common_dir_real "$PROJ_ABS")
+  if [ -z "$PROJ_COMMON_DIR" ]; then
+    echo "error: project directory '$PROJ_ABS' is not a git working-tree root (an interrupted clone, or a directory that was never a repository), so nothing can be verified as a worktree of it; refusing to launch to avoid tangling the primary checkout" >&2
+    exit 1
+  fi
+fi
 
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
@@ -703,15 +759,35 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
   # Reject a worktree that belongs to a DIFFERENT repository than the project
   # clone - firstmate's own repo (FM_ROOT), a secondmate home, or another clone.
-  # tmux's display-message silently falls back to the active window when a target
-  # does not resolve, so a lost or empty window id can cause the worktree-discovery
-  # poll to read firstmate's own pane path; this backstop turns that silent
-  # mis-record into a loud, safe spawn refusal. Repository identity, not path
-  # containment, is the test: a pooled worktree of the project is legitimate
-  # wherever it lives, including under the clone itself when treehouse.toml sets a
-  # repo-relative root (<clone>/.treehouse/<n>, inside FM_HOME by construction).
-  wt_common=$(git_common_dir_real "$WT")
-  proj_common=$(git_common_dir_real "$PROJ_ABS")
+  # Repository identity, not path containment, is the test: a pooled worktree of
+  # the project is legitimate wherever it lives, including under the clone itself
+  # when treehouse.toml sets a repo-relative root (<clone>/.treehouse/<n>, inside
+  # FM_HOME by construction).
+  #
+  # Two known races can cause the worktree-discovery poll above to accept a bogus
+  # path. This backstop is defense-in-depth against both:
+  #
+  #   1. PR #4's race: tmux display-message -t <bad-name> silently falls back to
+  #      the active window, reading firstmate's own pane path. The poll's
+  #      window-id verification (spawn_current_path) catches this one, so it
+  #      should never reach this backstop. Still checked here.
+  #
+  #   2. The pre-chdir race: a freshly created tmux window reports the TMUX
+  #      SERVER's cwd on the first #{pane_current_path} read, BEFORE the shell
+  #      has chdir'd into the -c directory. The window id is CORRECT the whole
+  #      time (so race #1's guard is blind to this), and the path differs from
+  #      PROJ_ABS_REAL (so the old naive poll accepted it). The poll now uses
+  #      this same repo-identity check to reject transient pre-chdir reads, so
+  #      the loop keeps polling and this backstop should also never be reached
+  #      for this race. Still checked here as defense-in-depth.
+  #
+  # An empty proj_common means the project directory is not a git working-tree
+  # root at all (an interrupted clone, a hand-made directory). It has no
+  # repository identity for a worktree to match, so nothing can be a worktree of
+  # it and the spawn is refused rather than inheriting the identity of whatever
+  # repo encloses projects/ - see git_worktree_common_dir_real.
+  wt_common=$(git_worktree_common_dir_real "$WT")
+  proj_common=$(git_worktree_common_dir_real "$PROJ_ABS")
   if [ -z "$wt_common" ] || [ -z "$proj_common" ] || [ "$wt_common" != "$proj_common" ]; then
     fm_root_real=$(cd "$FM_ROOT" 2>/dev/null && pwd -P) || fm_root_real="$FM_ROOT"
     fm_home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || fm_home_real="$FM_HOME"
@@ -883,16 +959,76 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # Compare against PROJ_ABS_REAL (physical), not PROJ_ABS: a symlinked project
   # prefix would otherwise make the pane's OS-level cwd read differ from
   # PROJ_ABS on the very first poll, before the pane has actually moved.
-  for _ in $(seq 1 60); do
+  #
+  # Two races make "differs from PROJ_ABS_REAL" insufficient as an acceptance test:
+  #   1. PR #4's race: tmux display-message -t <bad-name> silently falls back to
+  #      the active window, reading firstmate's own pane path. The window-id
+  #      verification in spawn_current_path catches this one.
+  #   2. The pre-chdir race: a freshly created window reports the TMUX SERVER's
+  #      cwd on the first #{pane_current_path} read, BEFORE the shell has chdir'd
+  #      into the -c directory. This path differs from PROJ_ABS_REAL (so the old
+  #      check passed), but it is NOT a worktree of the project - it is firstmate's
+  #      own repo root, or some other arbitrary path. The window id is CORRECT, so
+  #      race #1's guard does not catch this.
+  #
+  # Fix: accept a candidate path ONLY when it is itself the ROOT of a git worktree
+  # belonging to the SAME repository as the project clone - the same anchored
+  # repo-identity predicate validate_spawn_worktree uses, applied to both sides of
+  # the comparison. Anchoring the CANDIDATE matters as much as anchoring the
+  # project: git's lookup walks UP, so an unanchored candidate test would accept
+  # any path INSIDE the clone or one of its worktrees (a subdirectory the tmux
+  # server happened to sit in), lock the loop onto it, and turn the pre-chdir race
+  # into a spurious isolation abort instead of a tangle.
+  #
+  # A transient pre-chdir read fails that test, so the loop keeps polling instead
+  # of locking onto a bogus path. There is no escape hatch for a path that stays
+  # wrong: any other outcome would need a timing assumption about how long the
+  # pre-chdir window lasts, which is the very assumption that produced the bug. A
+  # permanently wrong path simply runs the loop out, and the timeout reports the
+  # last candidate and why it failed.
+  #
+  # PROJ_COMMON_DIR is the project's anchored repository identity, already resolved
+  # (and its absence already refused) as a pre-flight check above.
+  wt_poll_seconds=${FM_SPAWN_WORKTREE_TIMEOUT:-60}
+  case "$wt_poll_seconds" in
+    ''|*[!0-9]*) wt_poll_valid=no ;;
+    *) [ "$wt_poll_seconds" -gt 0 ] && wt_poll_valid=yes || wt_poll_valid=no ;;
+  esac
+  if [ "$wt_poll_valid" != yes ]; then
+    echo "warning: ignoring FM_SPAWN_WORKTREE_TIMEOUT='$wt_poll_seconds' (want a positive integer number of seconds); using 60" >&2
+    wt_poll_seconds=60
+  fi
+  last_p=
+  for _ in $(seq 1 "$wt_poll_seconds"); do
     p=$(spawn_current_path "$WT_TARGET" "${WID:-}" || true)
-    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
-      WT="$p"
-      break
+    if [ -n "$p" ]; then
+      if [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
+        cand_common=$(git_worktree_common_dir_real "$p")
+        if [ -n "$cand_common" ] && [ "$cand_common" = "$PROJ_COMMON_DIR" ]; then
+          WT="$p"
+          break
+        fi
+      fi
+      last_p=$p
     fi
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    echo "error: treehouse get did not enter a worktree of $PROJ_ABS within ${wt_poll_seconds}s; inspect window $T" >&2
+    if [ -n "$last_p" ]; then
+      # Classify once, from the surviving candidate: the loop only needs the
+      # accept/reject verdict, and the operator only ever reads this one reason.
+      if [ "$(real_path_or_raw "$last_p")" = "$PROJ_ABS_REAL" ]; then
+        last_reason="pane never left the project clone"
+      elif [ "$(git_common_dir_real "$last_p")" = "$PROJ_COMMON_DIR" ]; then
+        last_reason="inside the project repository but not the root of a worktree"
+      else
+        last_reason="not a worktree of the project repository"
+      fi
+      echo "  last pane path seen: $last_p ($last_reason)" >&2
+    else
+      echo "  no pane path could be read from window $T" >&2
+    fi
     exit 1
   fi
 

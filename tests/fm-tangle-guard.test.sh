@@ -158,6 +158,9 @@ make_spawn_fakebin() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+if [ -n "${FM_FAKE_TMUX_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FM_FAKE_TMUX_LOG"
+fi
 case "$*" in
   *"#{window_id} #{pane_current_path}"*)
     printf '@fakewid %s\n' "${FM_FAKE_PANE_PATH:-}"
@@ -189,6 +192,7 @@ run_spawn() {
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$pane" TMUX="fake,1,0" \
+    FM_SPAWN_WORKTREE_TIMEOUT=3 \
     PATH="$fakebin:$PATH" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$proj" codex 2>&1
 }
@@ -203,16 +207,35 @@ test_spawn_isolation_abort() {
   git -C "$proj" worktree add -q --detach "$TMP_ROOT/spawn-wt" >/dev/null 2>&1
   mkdir -p "$TMP_ROOT/spawn-notgit" "$proj/sub"
 
-  # Abort: the pane resolves to a plain non-git directory (not a worktree at all).
+  # Abort: the pane never reaches a worktree of the project (a plain non-git dir).
+  # The poll never accepts it - there is no stable-wrong-path early-accept - so the
+  # loop runs out and the timeout error names the last candidate and why it failed.
   out=$(run_spawn "$home" abort-notgit-dd4 "$proj" "$TMP_ROOT/spawn-notgit" "$fakebin"); status=$?
   expect_code 1 "$status" "spawn into a non-worktree dir should abort"
-  assert_contains "$out" "did not yield an isolated worktree" "non-worktree spawn lacked the isolation error"
+  assert_contains "$out" "did not enter a worktree of $proj" "non-worktree spawn lacked the poll timeout error"
+  assert_contains "$out" "last pane path seen: $TMP_ROOT/spawn-notgit (not a worktree of the project repository)" \
+    "poll timeout did not report the last-seen candidate path and its rejection reason"
   assert_absent "$home/state/abort-notgit-dd4.meta" "aborted spawn must not record meta"
 
   # Abort: the pane resolves INTO the primary checkout (a subdir of PROJ_ABS).
+  # git's lookup walks UP, so this path reports the project's own repository - the
+  # poll must still refuse it, because a candidate has to BE a worktree root, not
+  # merely sit somewhere inside the project's repository.
   out=$(run_spawn "$home" abort-primary-ee5 "$proj" "$proj/sub" "$fakebin"); status=$?
   expect_code 1 "$status" "spawn landing inside the primary checkout should abort"
-  assert_contains "$out" "did not yield an isolated worktree" "primary-checkout spawn lacked the isolation error"
+  assert_contains "$out" "did not enter a worktree of $proj" "primary-checkout spawn lacked the poll timeout error"
+  assert_contains "$out" "last pane path seen: $proj/sub (inside the project repository but not the root of a worktree)" \
+    "poll accepted a path inside the project repository that is not a worktree root"
+  assert_absent "$home/state/abort-primary-ee5.meta" "aborted spawn must not record meta"
+
+  # Abort: the pane resolves INTO a genuine worktree, but below its root. Same
+  # anchoring requirement: only the worktree ROOT is an acceptable candidate.
+  mkdir -p "$TMP_ROOT/spawn-wt/sub"
+  out=$(run_spawn "$home" abort-wtsub-gg7 "$proj" "$TMP_ROOT/spawn-wt/sub" "$fakebin"); status=$?
+  expect_code 1 "$status" "spawn landing below a worktree root should abort"
+  assert_contains "$out" "last pane path seen: $TMP_ROOT/spawn-wt/sub (inside the project repository but not the root of a worktree)" \
+    "poll accepted a subdirectory of a worktree instead of the worktree root"
+  assert_absent "$home/state/abort-wtsub-gg7.meta" "aborted spawn must not record meta"
 
   # Proceed: the pane resolves to a genuine, isolated worktree.
   out=$(run_spawn "$home" ok-isolated-ff6 "$proj" "$TMP_ROOT/spawn-wt" "$fakebin"); status=$?
@@ -431,7 +454,7 @@ test_spawn_empty_wid_abort() {
 # repo-relative treehouse pool under the clone itself, which sits INSIDE FM_HOME
 # by construction (projects live at $FM_HOME/projects/<name>).
 test_spawn_isolation_rejects_firstmate_paths() {
-  local home proj fakebin out status fm_root home_repo pooled pooled_wt
+  local home proj fakebin out status fm_root home_repo pooled pooled_wt nongit_proj
   home="$TMP_ROOT/spawn-rej-home"
   proj=$(make_repo "$TMP_ROOT/spawn-rej-proj")
   fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-rej-fake")
@@ -455,19 +478,48 @@ test_spawn_isolation_rejects_firstmate_paths() {
       FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
       FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
       FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$pane" TMUX="fake,1,0" \
+      FM_SPAWN_WORKTREE_TIMEOUT=3 \
       PATH="$fakebin:$PATH" \
       "$ROOT/bin/fm-spawn.sh" "$id" "$project" codex 2>&1
   }
 
-  # Reject: fake pane path resolves to FM_ROOT itself.
+  # Reject: fake pane path resolves to FM_ROOT itself. When the project IS a git
+  # repo, the poll's own repo-identity gate refuses the foreign path and never
+  # accepts it, so the spawn dies at the poll timeout rather than reaching the
+  # backstop; either way it aborts and records no meta.
   out=$(rej_run rej-root-ii9 "$proj" "$fm_root"); status=$?
   expect_code 1 "$status" "spawn into FM_ROOT should abort"
-  assert_contains "$out" "at or inside firstmate's own repo" "FM_ROOT rejection lacked the isolation error"
+  assert_contains "$out" "did not enter a worktree of $proj" "FM_ROOT spawn was not refused by the poll"
+  assert_contains "$out" "last pane path seen: $fm_root (not a worktree of the project repository)" \
+    "FM_ROOT poll refusal did not report the last-seen candidate path and its reason"
+  assert_absent "$home/state/rej-root-ii9.meta" "refused spawn must not record meta"
 
   # Reject: fake pane path resolves to another clone inside FM_HOME.
   out=$(rej_run rej-home-jj0 "$proj" "$home_repo"); status=$?
   expect_code 1 "$status" "spawn into a foreign repo inside FM_HOME should abort"
-  assert_contains "$out" "at or inside firstmate's home" "FM_HOME rejection lacked the isolation error"
+  assert_contains "$out" "did not enter a worktree of $proj" "FM_HOME spawn was not refused by the poll"
+  assert_absent "$home/state/rej-home-jj0.meta" "refused spawn must not record meta"
+
+  # A project directory with no repository identity of its own has nothing a
+  # worktree could belong to, so no pane path can ever be valid. The spawn is
+  # refused before the first pane read, naming the malformed project directory
+  # rather than blaming whatever path the pane happened to report.
+  nongit_proj="$TMP_ROOT/spawn-rej-nongit-proj"
+  mkdir -p "$nongit_proj"
+
+  out=$(rej_run rej-nongit-root-l3 "$nongit_proj" "$fm_root"); status=$?
+  expect_code 1 "$status" "spawn from a non-git project directory should abort"
+  assert_contains "$out" "project directory '$nongit_proj' is not a git working-tree root" \
+    "non-git project rejection did not name the malformed project directory"
+  assert_not_contains "$out" "last pane path seen" \
+    "non-git project spawn must fail before polling the pane, not after"
+  assert_absent "$home/state/rej-nongit-root-l3.meta" "refused spawn must not record meta"
+
+  out=$(rej_run rej-nongit-home-m4 "$nongit_proj" "$home_repo"); status=$?
+  expect_code 1 "$status" "spawn from a non-git project directory should abort regardless of the pane path"
+  assert_contains "$out" "project directory '$nongit_proj' is not a git working-tree root" \
+    "non-git project rejection did not name the malformed project directory"
+  assert_absent "$home/state/rej-nongit-home-m4.meta" "refused spawn must not record meta"
 
   # Accept: genuine isolated worktree (not inside FM_ROOT/FM_HOME).
   out=$(rej_run ok-isolated-j1 "$proj" "$TMP_ROOT/spawn-rej-wt"); status=$?
@@ -479,7 +531,204 @@ test_spawn_isolation_rejects_firstmate_paths() {
   expect_code 0 "$status" "spawn into the project's own repo-relative pool worktree should succeed"
   assert_not_contains "$out" "not a worktree of the project repository" "repo-relative pool worktree wrongly refused"
 
-  pass "fm-spawn: validate_spawn_worktree rejects foreign-repo worktrees in FM_ROOT/FM_HOME and accepts pooled worktrees of the project"
+  pass "fm-spawn: foreign-repo paths in FM_ROOT/FM_HOME are refused by the poll (and a project directory with no repository identity is refused before it), while pooled worktrees of the project are accepted"
+}
+
+# --- Fix: poll loop rejects transient non-worktree paths on first read ---------
+
+# A fake tmux that returns a bogus (non-worktree) path on the first poll read,
+# and the real worktree path from the second read onward. The window id is stable
+# (always @transientwid) so the PR #4 window-id verification passes - only the
+# repo-identity check in the poll loop can reject the bogus first read.
+make_spawn_transient_fakebin() {
+  local dir=$1 bogus_path=$2 wt=$3 fb="$1/fakebin" counter="$1/poll-count"
+  mkdir -p "$fb"
+  : > "$counter"
+  cat > "$fb/tmux" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-}" in
+  display-message)
+    for a in "\$@"; do case "\$a" in *"#{window_id} #{pane_current_path}"*)
+      printf x >> "$counter"
+      if [ "\$(wc -c < "$counter")" -le 1 ]; then
+        printf '@transientwid %s\\n' "$bogus_path"
+      else
+        printf '@transientwid %s\\n' "$wt"
+      fi
+      exit 0
+    ;; *pane_current_path*)
+      printf x >> "$counter"
+      if [ "\$(wc -c < "$counter")" -le 1 ]; then
+        printf '%s\\n' "$bogus_path"
+      else
+        printf '%s\\n' "$wt"
+      fi
+      exit 0
+    ;; esac; done
+    printf 'firstmate\\n'; exit 0 ;;
+  new-window) printf '@transientwid\\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+  has-session|new-session|send-keys|set-window-option) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux"
+  fm_fake_exit0 "$fb" treehouse
+  printf '%s\n' "$fb"
+}
+
+run_spawn_transient() {
+  local home=$1 id=$2 proj=$3 fakebin=$4
+  mkdir -p "$home/data/$id"
+  printf 'brief\n' > "$home/data/$id/brief.md"
+  FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" codex 2>&1
+}
+
+test_spawn_poll_rejects_transient_cwd() {
+  local home proj wt bogus fakebin out status
+  home="$TMP_ROOT/spawn-transient-home"
+  mkdir -p "$home/data"
+  proj=$(make_repo "$TMP_ROOT/spawn-transient-proj")
+  wt="$TMP_ROOT/spawn-transient-wt"
+  git -C "$proj" worktree add -q --detach "$wt" >/dev/null 2>&1
+
+  # Case 1: first read is a non-git directory (e.g. a temp dir the shell briefly
+  # passed through). The repo-identity check rejects it because git_common_dir_real
+  # returns empty for a non-git path. The poll keeps going and accepts the real
+  # worktree on the second read.
+  bogus="$TMP_ROOT/spawn-transient-bogus1"
+  mkdir -p "$bogus"
+  fakebin=$(make_spawn_transient_fakebin "$TMP_ROOT/spawn-transient-fake1" "$bogus" "$wt")
+  out=$(run_spawn_transient "$home" transient-nongit-mm4 "$proj" "$fakebin"); status=$?
+  expect_code 0 "$status" "spawn should succeed when the first poll read is a transient non-git path"$'\n'"$out"
+  assert_contains "$out" "spawned transient-nongit-mm4" "spawn did not report success for transient-nongit case"
+  assert_contains "$out" "worktree=$wt" "spawn recorded wrong worktree for transient-nongit case (expected $wt)"
+  assert_not_contains "$out" "did not yield an isolated worktree" "transient-nongit spawn wrongly tripped the isolation guard"
+
+  # Case 2: first read is firstmate's own repo root - the exact real-world bug.
+  # This path IS a git repo, but of a DIFFERENT repository than the project, so
+  # git_common_dir_real differs and the poll rejects it. The window id is stable
+  # the whole time (PR #4's guard passes), so only the repo-identity check catches
+  # this.
+  bogus=$(cd "$ROOT" && pwd -P)
+  fakebin=$(make_spawn_transient_fakebin "$TMP_ROOT/spawn-transient-fake2" "$bogus" "$wt")
+  out=$(run_spawn_transient "$home" transient-fmroot-nn5 "$proj" "$fakebin"); status=$?
+  expect_code 0 "$status" "spawn should succeed when the first poll read is firstmate's own repo root"$'\n'"$out"
+  assert_contains "$out" "spawned transient-fmroot-nn5" "spawn did not report success for transient-fmroot case"
+  assert_contains "$out" "worktree=$wt" "spawn recorded wrong worktree for transient-fmroot case (expected $wt)"
+  assert_not_contains "$out" "not a worktree of the project repository" "transient-fmroot spawn wrongly tripped the isolation guard"
+
+  pass "fm-spawn: poll loop rejects a transient pre-chdir path (non-git or foreign-repo) on the first read, keeps polling, and accepts the real worktree"
+}
+
+# The identity checks resolve a repository by asking git about a directory, and
+# git's lookup walks UP the tree. Projects live at $FM_HOME/projects/<name>,
+# INSIDE firstmate's own repo, so a project directory that is not a repo of its
+# own (an interrupted clone, a hand-made dir) would inherit firstmate's OWN
+# repository identity - and a pre-chdir read of firstmate's repo root would then
+# "match the project's repository", passing both the poll gate and the backstop
+# and recording firstmate's primary checkout as the crewmate's worktree.
+# The identity predicate is anchored at the git working-tree ROOT so a non-repo
+# directory has NO identity, which is what makes the refusal hold. This case is
+# built in the production shape (project nested inside the FM_ROOT repo), which
+# is what test_spawn_isolation_rejects_firstmate_paths' non-git cases - project
+# outside every repo - cannot detect.
+test_spawn_nongit_project_inside_fm_root() {
+  local home fm_root proj fakebin out status tmuxlog
+  fm_root=$(make_repo "$TMP_ROOT/spawn-nested-fmroot")
+  home="$fm_root"
+  # The project directory exists but is not a git repo, and it is nested inside
+  # firstmate's own repo exactly as a real projects/<name> clone would be.
+  proj="$fm_root/projects/broken-clone"
+  mkdir -p "$proj"
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-nested-fake")
+  tmuxlog="$TMP_ROOT/spawn-nested-tmux.log"
+  : > "$tmuxlog"
+
+  # The pane reports firstmate's own repo root - the pre-chdir read of race #2.
+  mkdir -p "$home/data/nested-nongit-p8"
+  printf 'brief\n' > "$home/data/nested-nongit-p8/brief.md"
+  out=$(FM_ROOT_OVERRIDE="$fm_root" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$fm_root" TMUX="fake,1,0" \
+    FM_SPAWN_WORKTREE_TIMEOUT=3 FM_FAKE_TMUX_LOG="$tmuxlog" \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" nested-nongit-p8 "$proj" codex 2>&1); status=$?
+
+  expect_code 1 "$status" "spawn must abort when a non-repo project nested in FM_ROOT would inherit firstmate's repo identity"$'\n'"$out"
+  assert_contains "$out" "project directory '$proj' is not a git working-tree root" \
+    "nested non-git project spawn was not refused by the anchored repo-identity check"
+  assert_absent "$home/state/nested-nongit-p8.meta" \
+    "refused spawn must not record meta (firstmate's own repo root as worktree=)"
+  # The refusal is a PRE-FLIGHT check: refusing after the backend created fm-<id>
+  # would strand an orphan window that collides with the duplicate-name check when
+  # the repaired clone is retried under the same task id.
+  assert_not_contains "$(cat "$tmuxlog")" "new-window" \
+    "non-repo project was refused only AFTER the task window was created"
+
+  pass "fm-spawn: a non-repo project nested inside FM_ROOT cannot inherit firstmate's repository identity, and is refused before any window is created"
+}
+
+# The poll budget is an env knob. A value that is not a positive integer makes
+# `seq 1 <bad>` empty, which would silently collapse the loop to zero iterations:
+# the poll would never read the pane at all and the spawn would die reporting an
+# unreadable pane, pointing the operator at tmux rather than at their env value.
+# A bad value must warn and fall back to the default budget instead. Driving it
+# with a pane that already sits in the real worktree keeps the case fast: a live
+# loop breaks on its first read, a collapsed one never runs.
+test_spawn_poll_timeout_knob_validation() {
+  local home proj wt fakebin out status bad id n
+  home="$TMP_ROOT/spawn-knob-home"
+  mkdir -p "$home/data"
+  proj=$(make_repo "$TMP_ROOT/spawn-knob-proj")
+  wt="$TMP_ROOT/spawn-knob-wt"
+  git -C "$proj" worktree add -q --detach "$wt" >/dev/null 2>&1
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-knob-fake")
+
+  n=0
+  for bad in 0 abc 12s; do
+    n=$((n + 1))
+    id="knob-bad$n-q2"
+    mkdir -p "$home/data/$id"
+    printf 'brief\n' > "$home/data/$id/brief.md"
+    out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+      FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+      FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+      FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+      FM_SPAWN_WORKTREE_TIMEOUT="$bad" \
+      PATH="$fakebin:$PATH" \
+      "$ROOT/bin/fm-spawn.sh" "$id" "$proj" codex 2>&1); status=$?
+
+    expect_code 0 "$status" "FM_SPAWN_WORKTREE_TIMEOUT='$bad' must fall back to the default budget, not collapse the poll loop"$'\n'"$out"
+    assert_contains "$out" "ignoring FM_SPAWN_WORKTREE_TIMEOUT='$bad'" \
+      "invalid poll-timeout value '$bad' was not reported to the operator"
+    assert_contains "$out" "worktree=$wt" "poll did not run with an invalid FM_SPAWN_WORKTREE_TIMEOUT='$bad'"
+    assert_not_contains "$out" "no pane path could be read" \
+      "FM_SPAWN_WORKTREE_TIMEOUT='$bad' misreported the failure as an unreadable pane"
+  done
+
+  # A valid value is honored silently.
+  mkdir -p "$home/data/knob-ok-r3"
+  printf 'brief\n' > "$home/data/knob-ok-r3/brief.md"
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_SPAWN_WORKTREE_TIMEOUT=3 \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" knob-ok-r3 "$proj" codex 2>&1); status=$?
+  expect_code 0 "$status" "a valid FM_SPAWN_WORKTREE_TIMEOUT should spawn cleanly"$'\n'"$out"
+  assert_not_contains "$out" "ignoring FM_SPAWN_WORKTREE_TIMEOUT" \
+    "a valid FM_SPAWN_WORKTREE_TIMEOUT was wrongly rejected"
+
+  pass "fm-spawn: an invalid FM_SPAWN_WORKTREE_TIMEOUT warns and falls back to the default poll budget"
 }
 
 test_lib_classification
@@ -491,3 +740,6 @@ test_spawn_tmux_window_construction
 test_tmux_path_read_target_verification
 test_spawn_empty_wid_abort
 test_spawn_isolation_rejects_firstmate_paths
+test_spawn_poll_rejects_transient_cwd
+test_spawn_nongit_project_inside_fm_root
+test_spawn_poll_timeout_knob_validation
