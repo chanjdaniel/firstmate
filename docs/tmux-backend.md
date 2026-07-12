@@ -144,7 +144,8 @@ Four defenses close both races, and they are independent on purpose:
 - **Repository identity in the poll itself** (race #2, and defense-in-depth for race #1).
   Before accepting a candidate path, the poll loop verifies it is a genuine git worktree belonging to the same repository as the project clone (`git rev-parse --git-common-dir` equality).
   A transient pre-chdir path (the tmux server's cwd) is not a worktree of the project, so the poll rejects it and keeps waiting.
-  The existing 60s timeout still bounds the loop.
+  There is no early-accept for a path that stays wrong: any such shortcut would need a timing assumption about how long the pre-chdir window lasts, which is exactly the assumption that produced race #2.
+  A permanently wrong path therefore just runs the 60s timeout out, and the timeout error names the last candidate path and why it was rejected so the failure is diagnosable without a live pane.
   A project that is not inside a git repo falls back to the simple path-diff test; `validate_spawn_worktree` catches any tangle in that path.
 - **Repository identity as the final backstop.** `fm-spawn.sh`'s `validate_spawn_worktree` requires the discovered worktree to belong to the project's own repository.
   A path belonging to a different one - firstmate's own repo or home, or another clone - aborts the spawn loudly instead of being recorded (see [`architecture.md`](architecture.md), "Worktrees, not branches in your checkout").

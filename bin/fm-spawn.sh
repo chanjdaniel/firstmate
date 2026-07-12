@@ -912,42 +912,46 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # Fix: accept a candidate path ONLY when it is a genuine git worktree of the
   # SAME repository as the project clone (the same repo-identity predicate
   # validate_spawn_worktree uses). A transient pre-chdir read fails that test,
-  # so the loop keeps polling instead of locking onto a bogus path.
+  # so the loop keeps polling instead of locking onto a bogus path. There is no
+  # escape hatch for a path that stays wrong: any other outcome would need a
+  # timing assumption about how long the pre-chdir window lasts, which is the
+  # very assumption that produced the bug. A permanently wrong path simply runs
+  # the loop out, and the timeout reports the last candidate and why it failed.
   proj_common_dir=$(git_common_dir_real "$PROJ_ABS")
-  prev_p=
-  for _ in $(seq 1 60); do
+  wt_poll_seconds=${FM_SPAWN_WORKTREE_TIMEOUT:-60}
+  last_p=
+  last_reason=
+  for _ in $(seq 1 "$wt_poll_seconds"); do
     p=$(spawn_current_path "$WT_TARGET" "${WID:-}" || true)
-    if [ -n "$p" ] && [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
-      if [ -z "$proj_common_dir" ]; then
+    if [ -n "$p" ]; then
+      if [ "$(real_path_or_raw "$p")" = "$PROJ_ABS_REAL" ]; then
+        last_p=$p
+        last_reason="pane never left the project clone"
+      elif [ -z "$proj_common_dir" ]; then
         # Project is not inside a git repo - fall back to the simple
         # path-diff test. validate_spawn_worktree will catch any tangle.
         WT="$p"
         break
+      else
+        cand_common=$(git_common_dir_real "$p" || true)
+        if [ -n "$cand_common" ] && [ "$cand_common" = "$proj_common_dir" ]; then
+          # Candidate is a genuine worktree of the project repository.
+          WT="$p"
+          break
+        fi
+        last_p=$p
+        last_reason="not a worktree of the project repository"
       fi
-      cand_common=$(git_common_dir_real "$p" || true)
-      if [ -n "$cand_common" ] && [ "$cand_common" = "$proj_common_dir" ]; then
-        # Candidate is a genuine worktree of the project repository.
-        WT="$p"
-        break
-      fi
-      # The candidate is not a worktree of the project. It could be:
-      #   a) A transient pre-chdir read (tmux server's cwd, firstmate's repo
-      #      root) that will change on the next poll. Keep polling.
-      #   b) A stable wrong path (permanent misconfiguration). Accept it after
-      #      one extra stable read and let validate_spawn_worktree produce the
-      #      error with diagnostic detail (path, FM_ROOT/FM_HOME proximity).
-      # The pre-chdir race resolves in well under a second, so two identical
-      # reads one second apart rules out case (a).
-      if [ -n "$prev_p" ] && [ "$p" = "$prev_p" ]; then
-        WT="$p"
-        break
-      fi
-      prev_p=$p
     fi
     sleep 1
   done
   if [ -z "$WT" ]; then
-    echo "error: treehouse get did not enter a worktree within 60s; inspect window $T" >&2
+    echo "error: treehouse get did not enter a worktree of $PROJ_ABS within ${wt_poll_seconds}s; inspect window $T" >&2
+    if [ -n "$last_p" ]; then
+      echo "  last pane path seen: $last_p ($last_reason)" >&2
+    else
+      echo "  no pane path could be read from window $T" >&2
+    fi
     exit 1
   fi
 
