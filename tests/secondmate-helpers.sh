@@ -24,7 +24,14 @@ make_fake_tmux() {
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
-  has-session|new-session|new-window|send-keys|kill-window)
+  new-window)
+    printf '%s\n' "$*" >> "$FM_FAKE_TMUX_LOG"
+    # Real `new-window -dP -F '#{window_id}'` prints the created window's stable
+    # id; a spawn aborts when it comes back empty, so the fake must print one too.
+    printf '@fakewid\n'
+    exit 0
+    ;;
+  has-session|new-session|send-keys|kill-window|set-window-option)
     printf '%s\n' "$*" >> "$FM_FAKE_TMUX_LOG"
     exit 0
     ;;

@@ -375,6 +375,7 @@ make_spawn_emptywid_fakebin() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+[ -n "${FM_TMUX_REC:-}" ] && printf 'tmux %s\n' "$*" >> "$FM_TMUX_REC"
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
@@ -382,7 +383,7 @@ case "${1:-}" in
   display-message) printf 'firstmate\n'; exit 0 ;;
   new-window) exit 0 ;;   # succeeds but prints nothing (simulates empty WID)
   list-windows) exit 0 ;;
-  has-session|new-session|send-keys|set-window-option) exit 0 ;;
+  has-session|new-session|send-keys|set-window-option|kill-window) exit 0 ;;
 esac
 exit 0
 SH
@@ -392,7 +393,7 @@ SH
 }
 
 test_spawn_empty_wid_abort() {
-  local home proj fakebin out status wt
+  local home proj fakebin out status wt rec
   home="$TMP_ROOT/spawn-ew-home"
   mkdir -p "$home/data/ew-abort-hh8"
   printf 'brief\n' > "$home/data/ew-abort-hh8/brief.md"
@@ -400,33 +401,54 @@ test_spawn_empty_wid_abort() {
   fakebin=$(make_spawn_emptywid_fakebin "$TMP_ROOT/spawn-ew-fake")
   wt="$TMP_ROOT/spawn-ew-wt"
   git -C "$proj" worktree add -q --detach "$wt" >/dev/null 2>&1
+  rec="$TMP_ROOT/spawn-ew-rec"
+  : > "$rec"
 
   out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
-    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" FM_TMUX_REC="$rec" \
     PATH="$fakebin:$PATH" \
     "$ROOT/bin/fm-spawn.sh" ew-abort-hh8 "$proj" codex 2>&1); status=$?
   expect_code 1 "$status" "spawn with empty WID should abort"
   assert_contains "$out" "tmux did not return a window id" "empty-WID spawn did not report the clear error"
   assert_absent "$home/state/ew-abort-hh8.meta" "aborted empty-WID spawn must not record meta"
+  # new-window already created the window, so the abort must not leak it: a
+  # retry of the same task id would otherwise trip the duplicate-name check.
+  assert_grep "kill-window -t firstmate:fm-ew-abort-hh8" "$rec" \
+    "the empty-WID abort must kill the orphan window it created"
 
-  pass "fm-spawn: aborts with clear error when tmux returns an empty window id"
+  pass "fm-spawn: aborts with clear error and kills the orphan window when tmux returns an empty window id"
 }
 
-# --- Fix: validate_spawn_worktree rejects FM_ROOT / FM_HOME -------------------
+# --- Fix: validate_spawn_worktree rejects foreign-repository worktrees --------
 
+# The backstop is REPOSITORY identity, not path containment: the discovered
+# worktree must share a git common dir with the project clone. That rejects
+# firstmate's own repo (FM_ROOT), firstmate's home (FM_HOME, e.g. a secondmate
+# home distinct from FM_ROOT), and any other clone, while still accepting a
+# legitimate pooled worktree of the project wherever it lives - including a
+# repo-relative treehouse pool under the clone itself, which sits INSIDE FM_HOME
+# by construction (projects live at $FM_HOME/projects/<name>).
 test_spawn_isolation_rejects_firstmate_paths() {
-  local home proj fakebin out status fm_root
+  local home proj fakebin out status fm_root home_repo pooled pooled_wt
   home="$TMP_ROOT/spawn-rej-home"
   proj=$(make_repo "$TMP_ROOT/spawn-rej-proj")
   fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-rej-fake")
   git -C "$proj" worktree add -q --detach "$TMP_ROOT/spawn-rej-wt" >/dev/null 2>&1
   fm_root=$(cd "$ROOT" && pwd -P)
+  # A foreign clone living inside FM_HOME (FM_HOME != FM_ROOT here, as in a
+  # secondmate home): a git toplevel, but not a worktree of the project.
+  home_repo=$(make_repo "$home/projects/other-clone")
+  # The project's own pool worktree, placed under the clone the way a
+  # treehouse.toml with `root = "./"` places it - inside FM_HOME.
+  pooled=$(make_repo "$home/projects/pooled-proj")
+  pooled_wt="$pooled/.treehouse/1"
+  git -C "$pooled" worktree add -q --detach "$pooled_wt" >/dev/null 2>&1
 
-  # Helper: create brief and run spawn for a given id and pane path.
+  # Helper: create brief and run spawn for a given id, project, and pane path.
   rej_run() {
-    local id=$1 pane=$2
+    local id=$1 project=$2 pane=$3
     mkdir -p "$home/data/$id"
     printf 'brief\n' > "$home/data/$id/brief.md"
     FM_ROOT_OVERRIDE="$fm_root" FM_HOME="$home" \
@@ -434,20 +456,30 @@ test_spawn_isolation_rejects_firstmate_paths() {
       FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
       FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$pane" TMUX="fake,1,0" \
       PATH="$fakebin:$PATH" \
-      "$ROOT/bin/fm-spawn.sh" "$id" "$proj" codex 2>&1
+      "$ROOT/bin/fm-spawn.sh" "$id" "$project" codex 2>&1
   }
 
   # Reject: fake pane path resolves to FM_ROOT itself.
-  out=$(rej_run rej-root-ii9 "$fm_root"); status=$?
+  out=$(rej_run rej-root-ii9 "$proj" "$fm_root"); status=$?
   expect_code 1 "$status" "spawn into FM_ROOT should abort"
   assert_contains "$out" "at or inside firstmate's own repo" "FM_ROOT rejection lacked the isolation error"
 
-  # Accept: genuine isolated worktree (not inside FM_ROOT/FM_HOME).
-  out=$(rej_run ok-isolated-j1 "$TMP_ROOT/spawn-rej-wt"); status=$?
-  expect_code 0 "$status" "spawn into a genuine isolated worktree should succeed"
-  assert_not_contains "$out" "at or inside firstmate's" "isolated spawn wrongly tripped the FM_ROOT guard"
+  # Reject: fake pane path resolves to another clone inside FM_HOME.
+  out=$(rej_run rej-home-jj0 "$proj" "$home_repo"); status=$?
+  expect_code 1 "$status" "spawn into a foreign repo inside FM_HOME should abort"
+  assert_contains "$out" "at or inside firstmate's home" "FM_HOME rejection lacked the isolation error"
 
-  pass "fm-spawn: validate_spawn_worktree rejects worktrees at or inside FM_ROOT"
+  # Accept: genuine isolated worktree (not inside FM_ROOT/FM_HOME).
+  out=$(rej_run ok-isolated-j1 "$proj" "$TMP_ROOT/spawn-rej-wt"); status=$?
+  expect_code 0 "$status" "spawn into a genuine isolated worktree should succeed"
+  assert_not_contains "$out" "not a worktree of the project repository" "isolated spawn wrongly tripped the guard"
+
+  # Accept: repo-relative pool worktree of the project, inside FM_HOME.
+  out=$(rej_run ok-pooled-k2 "$pooled" "$pooled_wt"); status=$?
+  expect_code 0 "$status" "spawn into the project's own repo-relative pool worktree should succeed"
+  assert_not_contains "$out" "not a worktree of the project repository" "repo-relative pool worktree wrongly refused"
+
+  pass "fm-spawn: validate_spawn_worktree rejects foreign-repo worktrees in FM_ROOT/FM_HOME and accepts pooled worktrees of the project"
 }
 
 test_lib_classification

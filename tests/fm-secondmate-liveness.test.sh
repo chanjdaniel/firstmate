@@ -209,7 +209,13 @@ case "${1:-}" in
   display-message)
     for a in "$@"; do case "$a" in *pane_current_command*) printf '%s\n' "${FM_TEST_PANE_CMD:-zsh}"; exit 0 ;; esac; done
     exit 0 ;;
-  new-window|kill-window)
+  new-window)
+    printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
+    # Real `new-window -dP -F '#{window_id}'` prints the created window's stable
+    # id; a spawn aborts when it comes back empty, so the fake must print one too.
+    printf '@fakewid\n'
+    exit 0 ;;
+  kill-window)
     printf '%s\n' "$*" >> "${FM_TMUX_CALL_LOG:?}"
     exit 0 ;;
   list-windows|has-session) exit 0 ;;

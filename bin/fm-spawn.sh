@@ -660,6 +660,20 @@ real_path_or_raw() {  # <path>
   fi
 }
 
+# git_common_dir_real: the physically-resolved shared git directory of <dir>'s
+# repository, or empty when <dir> is not inside a git repository. A clone and
+# every worktree of it - a treehouse pool worktree, an Orca worktree - share one
+# common dir, so it identifies the REPOSITORY independently of where on disk the
+# worktree happens to live.
+git_common_dir_real() {  # <dir>
+  local dir=$1 common real
+  common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
+  [ -n "$common" ] || return 0
+  # --git-common-dir can be relative to <dir> (plain ".git" in a clone).
+  real=$(cd "$dir" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P) || return 0
+  printf '%s\n' "$real"
+}
+
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -669,7 +683,8 @@ real_path_or_raw() {  # <path>
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
 validate_spawn_worktree() {  # <source> <inspect-target>
-  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real fm_root_real fm_home_real
+  local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+  local wt_common proj_common fm_root_real fm_home_real where
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -684,19 +699,27 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
-  # Reject worktrees at or inside firstmate's own repo (FM_ROOT) and home
-  # (FM_HOME). tmux's display-message silently falls back to the active window
-  # when a target does not resolve, so a lost or empty window id can cause the
-  # worktree-discovery poll to read firstmate's own pane path. This backstop
-  # turns that silent mis-record into a loud, safe spawn refusal.
-  fm_root_real=$(cd "$FM_ROOT" 2>/dev/null && pwd -P) || fm_root_real="$FM_ROOT"
-  if [ "$wt_real" = "$fm_root_real" ] || path_is_ancestor_of "$fm_root_real" "$wt_real"; then
-    echo "error: $source resolved to a worktree at or inside firstmate's own repo ($fm_root_real); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
-    exit 1
-  fi
-  fm_home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || fm_home_real="$FM_HOME"
-  if [ -n "$fm_home_real" ] && [ "$fm_home_real" != "$fm_root_real" ] && { [ "$wt_real" = "$fm_home_real" ] || path_is_ancestor_of "$fm_home_real" "$wt_real"; }; then
-    echo "error: $source resolved to a worktree at or inside firstmate's home ($fm_home_real); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+  # Reject a worktree that belongs to a DIFFERENT repository than the project
+  # clone - firstmate's own repo (FM_ROOT), a secondmate home, or another clone.
+  # tmux's display-message silently falls back to the active window when a target
+  # does not resolve, so a lost or empty window id can cause the worktree-discovery
+  # poll to read firstmate's own pane path; this backstop turns that silent
+  # mis-record into a loud, safe spawn refusal. Repository identity, not path
+  # containment, is the test: a pooled worktree of the project is legitimate
+  # wherever it lives, including under the clone itself when treehouse.toml sets a
+  # repo-relative root (<clone>/.treehouse/<n>, inside FM_HOME by construction).
+  wt_common=$(git_common_dir_real "$WT")
+  proj_common=$(git_common_dir_real "$PROJ_ABS")
+  if [ -z "$wt_common" ] || [ -z "$proj_common" ] || [ "$wt_common" != "$proj_common" ]; then
+    fm_root_real=$(cd "$FM_ROOT" 2>/dev/null && pwd -P) || fm_root_real="$FM_ROOT"
+    fm_home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || fm_home_real="$FM_HOME"
+    where=
+    if [ "$wt_real" = "$fm_root_real" ] || path_is_ancestor_of "$fm_root_real" "$wt_real"; then
+      where=" at or inside firstmate's own repo ($fm_root_real)"
+    elif [ -n "$fm_home_real" ] && { [ "$wt_real" = "$fm_home_real" ] || path_is_ancestor_of "$fm_home_real" "$wt_real"; }; then
+      where=" at or inside firstmate's home ($fm_home_real)"
+    fi
+    echo "error: $source resolved to '$wt_real'$where, which is not a worktree of the project repository ($PROJ_ABS); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
     exit 1
   fi
 }
