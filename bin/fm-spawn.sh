@@ -715,6 +715,23 @@ git_worktree_common_dir_real() {  # <dir>
   git_common_dir_real "$dir"
 }
 
+# A project directory that is not a git working-tree root (an interrupted clone, a
+# hand-made directory) has no repository identity for a worktree to belong to, so
+# no path the worktree-discovery poll below could read can ever be valid. Refuse
+# up front, BEFORE the backend creates the task window: a refusal after creation
+# would leave an orphan window that makes a retry under the same task id collide
+# on the window name. Orca resolves its worktree from its own backend rather than
+# by polling a pane, and a secondmate's PROJ_ABS is a firstmate home, not a
+# project; both keep validate_spawn_worktree as their backstop.
+PROJ_COMMON_DIR=
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
+  PROJ_COMMON_DIR=$(git_worktree_common_dir_real "$PROJ_ABS")
+  if [ -z "$PROJ_COMMON_DIR" ]; then
+    echo "error: project directory '$PROJ_ABS' is not a git working-tree root (an interrupted clone, or a directory that was never a repository), so nothing can be verified as a worktree of it; refusing to launch to avoid tangling the primary checkout" >&2
+    exit 1
+  fi
+fi
+
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
 # left it (same session-name / new-window sequence, see bin/backends/tmux.sh);
 # a herdr spawn goes through the version-gated, workspace-per-HOME,
@@ -970,15 +987,8 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # permanently wrong path simply runs the loop out, and the timeout reports the
   # last candidate and why it failed.
   #
-  # A project directory that is not a git working-tree root (an interrupted clone,
-  # a hand-made directory) has no repository identity for a worktree to belong to,
-  # so no pane path can ever be valid. Fail before the first read rather than
-  # polling out the whole budget and then blaming whatever path the pane reported.
-  proj_common_dir=$(git_worktree_common_dir_real "$PROJ_ABS")
-  if [ -z "$proj_common_dir" ]; then
-    echo "error: project directory '$PROJ_ABS' is not a git working-tree root (an interrupted clone, or a directory that was never a repository), so nothing can be verified as a worktree of it; refusing to launch to avoid tangling the primary checkout" >&2
-    exit 1
-  fi
+  # PROJ_COMMON_DIR is the project's anchored repository identity, already resolved
+  # (and its absence already refused) as a pre-flight check above.
   wt_poll_seconds=${FM_SPAWN_WORKTREE_TIMEOUT:-60}
   case "$wt_poll_seconds" in
     ''|*[!0-9]*) wt_poll_valid=no ;;
@@ -989,32 +999,32 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
     wt_poll_seconds=60
   fi
   last_p=
-  last_reason=
   for _ in $(seq 1 "$wt_poll_seconds"); do
     p=$(spawn_current_path "$WT_TARGET" "${WID:-}" || true)
     if [ -n "$p" ]; then
-      if [ "$(real_path_or_raw "$p")" = "$PROJ_ABS_REAL" ]; then
-        last_p=$p
-        last_reason="pane never left the project clone"
-      else
+      if [ "$(real_path_or_raw "$p")" != "$PROJ_ABS_REAL" ]; then
         cand_common=$(git_worktree_common_dir_real "$p")
-        if [ -n "$cand_common" ] && [ "$cand_common" = "$proj_common_dir" ]; then
+        if [ -n "$cand_common" ] && [ "$cand_common" = "$PROJ_COMMON_DIR" ]; then
           WT="$p"
           break
         fi
-        last_p=$p
-        if [ "$(git_common_dir_real "$p")" = "$proj_common_dir" ]; then
-          last_reason="inside the project repository but not the root of a worktree"
-        else
-          last_reason="not a worktree of the project repository"
-        fi
       fi
+      last_p=$p
     fi
     sleep 1
   done
   if [ -z "$WT" ]; then
     echo "error: treehouse get did not enter a worktree of $PROJ_ABS within ${wt_poll_seconds}s; inspect window $T" >&2
     if [ -n "$last_p" ]; then
+      # Classify once, from the surviving candidate: the loop only needs the
+      # accept/reject verdict, and the operator only ever reads this one reason.
+      if [ "$(real_path_or_raw "$last_p")" = "$PROJ_ABS_REAL" ]; then
+        last_reason="pane never left the project clone"
+      elif [ "$(git_common_dir_real "$last_p")" = "$PROJ_COMMON_DIR" ]; then
+        last_reason="inside the project repository but not the root of a worktree"
+      else
+        last_reason="not a worktree of the project repository"
+      fi
       echo "  last pane path seen: $last_p ($last_reason)" >&2
     else
       echo "  no pane path could be read from window $T" >&2

@@ -158,6 +158,9 @@ make_spawn_fakebin() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+if [ -n "${FM_FAKE_TMUX_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FM_FAKE_TMUX_LOG"
+fi
 case "$*" in
   *"#{window_id} #{pane_current_path}"*)
     printf '@fakewid %s\n' "${FM_FAKE_PANE_PATH:-}"
@@ -637,7 +640,7 @@ test_spawn_poll_rejects_transient_cwd() {
 # is what test_spawn_isolation_rejects_firstmate_paths' non-git cases - project
 # outside every repo - cannot detect.
 test_spawn_nongit_project_inside_fm_root() {
-  local home fm_root proj fakebin out status
+  local home fm_root proj fakebin out status tmuxlog
   fm_root=$(make_repo "$TMP_ROOT/spawn-nested-fmroot")
   home="$fm_root"
   # The project directory exists but is not a git repo, and it is nested inside
@@ -645,6 +648,8 @@ test_spawn_nongit_project_inside_fm_root() {
   proj="$fm_root/projects/broken-clone"
   mkdir -p "$proj"
   fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-nested-fake")
+  tmuxlog="$TMP_ROOT/spawn-nested-tmux.log"
+  : > "$tmuxlog"
 
   # The pane reports firstmate's own repo root - the pre-chdir read of race #2.
   mkdir -p "$home/data/nested-nongit-p8"
@@ -653,7 +658,7 @@ test_spawn_nongit_project_inside_fm_root() {
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$fm_root" TMUX="fake,1,0" \
-    FM_SPAWN_WORKTREE_TIMEOUT=3 \
+    FM_SPAWN_WORKTREE_TIMEOUT=3 FM_FAKE_TMUX_LOG="$tmuxlog" \
     PATH="$fakebin:$PATH" \
     "$ROOT/bin/fm-spawn.sh" nested-nongit-p8 "$proj" codex 2>&1); status=$?
 
@@ -662,8 +667,13 @@ test_spawn_nongit_project_inside_fm_root() {
     "nested non-git project spawn was not refused by the anchored repo-identity check"
   assert_absent "$home/state/nested-nongit-p8.meta" \
     "refused spawn must not record meta (firstmate's own repo root as worktree=)"
+  # The refusal is a PRE-FLIGHT check: refusing after the backend created fm-<id>
+  # would strand an orphan window that collides with the duplicate-name check when
+  # the repaired clone is retried under the same task id.
+  assert_not_contains "$(cat "$tmuxlog")" "new-window" \
+    "non-repo project was refused only AFTER the task window was created"
 
-  pass "fm-spawn: a non-repo project nested inside FM_ROOT cannot inherit firstmate's repository identity"
+  pass "fm-spawn: a non-repo project nested inside FM_ROOT cannot inherit firstmate's repository identity, and is refused before any window is created"
 }
 
 # The poll budget is an env knob. A value that is not a positive integer makes
