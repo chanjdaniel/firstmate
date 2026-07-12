@@ -142,15 +142,18 @@ Five defenses close both races, and they are independent on purpose:
   The adapter kills the just-created window first - it exists even when its id was not printed, and would otherwise trip the duplicate-name check when the same task id is retried - then fails.
   The spawn aborts rather than degrading from the stable window id to the rename-fragile `<session>:<window-name>` target form.
 - **Repository identity in the poll itself** (race #2, and defense-in-depth for race #1).
-  Before accepting a candidate path, the poll loop verifies it is a genuine git worktree belonging to the same repository as the project clone (`git rev-parse --git-common-dir` equality).
-  A transient pre-chdir path (the tmux server's cwd) is not a worktree of the project, so the poll rejects it and keeps waiting.
+  Before accepting a candidate path, the poll loop verifies it is the ROOT of a git worktree belonging to the same repository as the project clone (`git rev-parse --git-common-dir` equality, anchored as below).
+  A transient pre-chdir path (the tmux server's cwd) is not a worktree root of the project, so the poll rejects it and keeps waiting.
   There is no early-accept for a path that stays wrong: any such shortcut would need a timing assumption about how long the pre-chdir window lasts, which is exactly the assumption that produced race #2.
   A permanently wrong path therefore just runs the poll budget out (60s by default; `FM_SPAWN_WORKTREE_TIMEOUT` overrides it with a positive integer number of seconds, and tests set it low to keep refusal cases fast), and the timeout error names the last candidate path and why it was rejected so the failure is diagnosable without a live pane.
-- **Repository identity is anchored at the working-tree root** (the condition that makes both identity checks sound).
-  `git rev-parse` walks UP the tree, so a directory that is not a repository of its own reports the identity of whatever repository ENCLOSES it - and projects live at `$FM_HOME/projects/<name>`, inside firstmate's own repo by construction.
-  A project directory that is not a git repo (an interrupted clone, a hand-made directory) would therefore be handed firstmate's OWN repository identity, and a pre-chdir read of firstmate's repo root would then match "the project's repository" and sail through both the poll and the backstop.
-  `git_worktree_common_dir_real` reports an identity only when the directory it is asked about is itself the ROOT of a git working tree, so a non-repo directory reports no identity at all.
-  That distinguishes "a different repository" from "no repository": a project with no repository identity has nothing that can be verified as a worktree of it, and the spawn is refused rather than tangling the primary checkout.
+- **Repository identity is anchored at the working-tree root, on both sides of the comparison** (the condition that makes every identity check sound).
+  `git rev-parse` walks UP the tree, so a directory that is not a working-tree root of its own reports the identity of whatever repository ENCLOSES it.
+  `git_worktree_common_dir_real` reports an identity only when the directory it is asked about is itself the ROOT of a git working tree, and empty otherwise, which is what distinguishes "a different repository" from "no repository" and "somewhere inside a repository".
+  It anchors the check in both directions:
+    - The **project** side: projects live at `$FM_HOME/projects/<name>`, inside firstmate's own repo by construction, so a project directory that is not a git repo (an interrupted clone, a hand-made directory) would otherwise be handed firstmate's OWN repository identity, and a pre-chdir read of firstmate's repo root would then match "the project's repository" and sail through both the poll and the backstop.
+      Such a project has no identity at all, so nothing can be verified as a worktree of it; `fm-spawn.sh` refuses the spawn before the first pane read, naming the malformed project directory rather than blaming whatever path the pane happened to report.
+    - The **candidate** side: a pane path INSIDE the clone or one of its worktrees (a subdirectory the tmux server's cwd happened to sit in) would otherwise report the project's own repository, be accepted, and lock the poll onto a transient path - turning race #2 into a spurious isolation abort instead of a tangle, and failing every spawn for that project.
+      Only a worktree ROOT of the project's repository is accepted; anything below one keeps the loop polling and is named in the timeout diagnostic.
 - **Repository identity as the final backstop.** `fm-spawn.sh`'s `validate_spawn_worktree` requires the discovered worktree to belong to the project's own repository.
   A path belonging to a different one - firstmate's own repo or home, or another clone - aborts the spawn loudly instead of being recorded (see [`architecture.md`](architecture.md), "Worktrees, not branches in your checkout").
   This is the safety net that caught race #2 before the poll-level fix; it now serves as defense-in-depth for both races.

@@ -215,9 +215,24 @@ test_spawn_isolation_abort() {
   assert_absent "$home/state/abort-notgit-dd4.meta" "aborted spawn must not record meta"
 
   # Abort: the pane resolves INTO the primary checkout (a subdir of PROJ_ABS).
+  # git's lookup walks UP, so this path reports the project's own repository - the
+  # poll must still refuse it, because a candidate has to BE a worktree root, not
+  # merely sit somewhere inside the project's repository.
   out=$(run_spawn "$home" abort-primary-ee5 "$proj" "$proj/sub" "$fakebin"); status=$?
   expect_code 1 "$status" "spawn landing inside the primary checkout should abort"
-  assert_contains "$out" "did not yield an isolated worktree" "primary-checkout spawn lacked the isolation error"
+  assert_contains "$out" "did not enter a worktree of $proj" "primary-checkout spawn lacked the poll timeout error"
+  assert_contains "$out" "last pane path seen: $proj/sub (inside the project repository but not the root of a worktree)" \
+    "poll accepted a path inside the project repository that is not a worktree root"
+  assert_absent "$home/state/abort-primary-ee5.meta" "aborted spawn must not record meta"
+
+  # Abort: the pane resolves INTO a genuine worktree, but below its root. Same
+  # anchoring requirement: only the worktree ROOT is an acceptable candidate.
+  mkdir -p "$TMP_ROOT/spawn-wt/sub"
+  out=$(run_spawn "$home" abort-wtsub-gg7 "$proj" "$TMP_ROOT/spawn-wt/sub" "$fakebin"); status=$?
+  expect_code 1 "$status" "spawn landing below a worktree root should abort"
+  assert_contains "$out" "last pane path seen: $TMP_ROOT/spawn-wt/sub (inside the project repository but not the root of a worktree)" \
+    "poll accepted a subdirectory of a worktree instead of the worktree root"
+  assert_absent "$home/state/abort-wtsub-gg7.meta" "aborted spawn must not record meta"
 
   # Proceed: the pane resolves to a genuine, isolated worktree.
   out=$(run_spawn "$home" ok-isolated-ff6 "$proj" "$TMP_ROOT/spawn-wt" "$fakebin"); status=$?
@@ -482,21 +497,25 @@ test_spawn_isolation_rejects_firstmate_paths() {
   assert_contains "$out" "did not enter a worktree of $proj" "FM_HOME spawn was not refused by the poll"
   assert_absent "$home/state/rej-home-jj0.meta" "refused spawn must not record meta"
 
-  # The poll's repo-identity gate cannot fire when the project is not inside a git
-  # repo - there is no repository to compare a candidate against - so the poll falls
-  # back to the plain path-diff test and validate_spawn_worktree becomes the only
-  # defense. It must still refuse, and still name where the tangle would have landed.
+  # A project directory with no repository identity of its own has nothing a
+  # worktree could belong to, so no pane path can ever be valid. The spawn is
+  # refused before the first pane read, naming the malformed project directory
+  # rather than blaming whatever path the pane happened to report.
   nongit_proj="$TMP_ROOT/spawn-rej-nongit-proj"
   mkdir -p "$nongit_proj"
 
   out=$(rej_run rej-nongit-root-l3 "$nongit_proj" "$fm_root"); status=$?
-  expect_code 1 "$status" "spawn into FM_ROOT from a non-git project should abort"
-  assert_contains "$out" "at or inside firstmate's own repo" "FM_ROOT rejection lacked the isolation error"
+  expect_code 1 "$status" "spawn from a non-git project directory should abort"
+  assert_contains "$out" "project directory '$nongit_proj' is not a git working-tree root" \
+    "non-git project rejection did not name the malformed project directory"
+  assert_not_contains "$out" "last pane path seen" \
+    "non-git project spawn must fail before polling the pane, not after"
   assert_absent "$home/state/rej-nongit-root-l3.meta" "refused spawn must not record meta"
 
   out=$(rej_run rej-nongit-home-m4 "$nongit_proj" "$home_repo"); status=$?
-  expect_code 1 "$status" "spawn into a foreign repo inside FM_HOME from a non-git project should abort"
-  assert_contains "$out" "at or inside firstmate's home" "FM_HOME rejection lacked the isolation error"
+  expect_code 1 "$status" "spawn from a non-git project directory should abort regardless of the pane path"
+  assert_contains "$out" "project directory '$nongit_proj' is not a git working-tree root" \
+    "non-git project rejection did not name the malformed project directory"
   assert_absent "$home/state/rej-nongit-home-m4.meta" "refused spawn must not record meta"
 
   # Accept: genuine isolated worktree (not inside FM_ROOT/FM_HOME).
@@ -509,7 +528,7 @@ test_spawn_isolation_rejects_firstmate_paths() {
   expect_code 0 "$status" "spawn into the project's own repo-relative pool worktree should succeed"
   assert_not_contains "$out" "not a worktree of the project repository" "repo-relative pool worktree wrongly refused"
 
-  pass "fm-spawn: foreign-repo paths in FM_ROOT/FM_HOME are refused by the poll (and by validate_spawn_worktree when the project is not a git repo), while pooled worktrees of the project are accepted"
+  pass "fm-spawn: foreign-repo paths in FM_ROOT/FM_HOME are refused by the poll (and a project directory with no repository identity is refused before it), while pooled worktrees of the project are accepted"
 }
 
 # --- Fix: poll loop rejects transient non-worktree paths on first read ---------
@@ -639,10 +658,8 @@ test_spawn_nongit_project_inside_fm_root() {
     "$ROOT/bin/fm-spawn.sh" nested-nongit-p8 "$proj" codex 2>&1); status=$?
 
   expect_code 1 "$status" "spawn must abort when a non-repo project nested in FM_ROOT would inherit firstmate's repo identity"$'\n'"$out"
-  assert_contains "$out" "not a worktree of the project repository" \
-    "nested non-git project spawn was not refused by the repo-identity backstop"
-  assert_contains "$out" "at or inside firstmate's own repo" \
-    "refusal did not name firstmate's own repo as where the tangle would have landed"
+  assert_contains "$out" "project directory '$proj' is not a git working-tree root" \
+    "nested non-git project spawn was not refused by the anchored repo-identity check"
   assert_absent "$home/state/nested-nongit-p8.meta" \
     "refused spawn must not record meta (firstmate's own repo root as worktree=)"
 

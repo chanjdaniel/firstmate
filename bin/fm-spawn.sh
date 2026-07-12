@@ -954,15 +954,31 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   #      own repo root, or some other arbitrary path. The window id is CORRECT, so
   #      race #1's guard does not catch this.
   #
-  # Fix: accept a candidate path ONLY when it is a genuine git worktree of the
-  # SAME repository as the project clone (the same repo-identity predicate
-  # validate_spawn_worktree uses). A transient pre-chdir read fails that test,
-  # so the loop keeps polling instead of locking onto a bogus path. There is no
-  # escape hatch for a path that stays wrong: any other outcome would need a
-  # timing assumption about how long the pre-chdir window lasts, which is the
-  # very assumption that produced the bug. A permanently wrong path simply runs
-  # the loop out, and the timeout reports the last candidate and why it failed.
+  # Fix: accept a candidate path ONLY when it is itself the ROOT of a git worktree
+  # belonging to the SAME repository as the project clone - the same anchored
+  # repo-identity predicate validate_spawn_worktree uses, applied to both sides of
+  # the comparison. Anchoring the CANDIDATE matters as much as anchoring the
+  # project: git's lookup walks UP, so an unanchored candidate test would accept
+  # any path INSIDE the clone or one of its worktrees (a subdirectory the tmux
+  # server happened to sit in), lock the loop onto it, and turn the pre-chdir race
+  # into a spurious isolation abort instead of a tangle.
+  #
+  # A transient pre-chdir read fails that test, so the loop keeps polling instead
+  # of locking onto a bogus path. There is no escape hatch for a path that stays
+  # wrong: any other outcome would need a timing assumption about how long the
+  # pre-chdir window lasts, which is the very assumption that produced the bug. A
+  # permanently wrong path simply runs the loop out, and the timeout reports the
+  # last candidate and why it failed.
+  #
+  # A project directory that is not a git working-tree root (an interrupted clone,
+  # a hand-made directory) has no repository identity for a worktree to belong to,
+  # so no pane path can ever be valid. Fail before the first read rather than
+  # polling out the whole budget and then blaming whatever path the pane reported.
   proj_common_dir=$(git_worktree_common_dir_real "$PROJ_ABS")
+  if [ -z "$proj_common_dir" ]; then
+    echo "error: project directory '$PROJ_ABS' is not a git working-tree root (an interrupted clone, or a directory that was never a repository), so nothing can be verified as a worktree of it; refusing to launch to avoid tangling the primary checkout" >&2
+    exit 1
+  fi
   wt_poll_seconds=${FM_SPAWN_WORKTREE_TIMEOUT:-60}
   case "$wt_poll_seconds" in
     ''|*[!0-9]*) wt_poll_valid=no ;;
@@ -980,26 +996,18 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
       if [ "$(real_path_or_raw "$p")" = "$PROJ_ABS_REAL" ]; then
         last_p=$p
         last_reason="pane never left the project clone"
-      elif [ -z "$proj_common_dir" ]; then
-        # The project directory is not a git working-tree root, so it has no
-        # repository identity to match a candidate against and this gate cannot
-        # fire at all. Fall back to the simple path-diff test; the same empty
-        # identity makes validate_spawn_worktree refuse whatever we accept here,
-        # so nothing is recorded (git_worktree_common_dir_real).
-        WT="$p"
-        break
       else
-        cand_common=$(git_common_dir_real "$p" || true)
+        cand_common=$(git_worktree_common_dir_real "$p")
         if [ -n "$cand_common" ] && [ "$cand_common" = "$proj_common_dir" ]; then
-          # Candidate belongs to the project's repository. It still has to BE a
-          # worktree root rather than some directory inside one; that is
-          # validate_spawn_worktree's assertion, which reports a subdirectory of
-          # the clone far more precisely than another poll timeout would.
           WT="$p"
           break
         fi
         last_p=$p
-        last_reason="not a worktree of the project repository"
+        if [ "$(git_common_dir_real "$p")" = "$proj_common_dir" ]; then
+          last_reason="inside the project repository but not the root of a worktree"
+        else
+          last_reason="not a worktree of the project repository"
+        fi
       fi
     fi
     sleep 1
