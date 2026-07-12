@@ -30,6 +30,40 @@ FM_TEST_LIB_SOURCED=1
 # shellcheck disable=SC2034
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# --- ambient environment isolation ------------------------------------------
+#
+# A suite run from inside a live firstmate session inherits that session's
+# FM_HOME. FM_HOME outranks the FM_ROOT_OVERRIDE/FM_STATE_OVERRIDE a fixture
+# sets, so scripts under test would resolve config/ and state/ from the
+# operator's real home instead of the fixture. Fixtures that want an FM_HOME
+# always set it per invocation, so the ambient one is never wanted.
+unset FM_HOME
+
+# --- system base PATH -------------------------------------------------------
+#
+# Suites that shim tools hand the script under test "<fakebin>:$BASE_PATH", so
+# BASE_PATH must carry the plain system dependencies the scripts genuinely need
+# (jq, git, curl) while excluding every tool the suite shims or expects to
+# detect as missing (node, gh-axi, tasks-axi, ...). The system dirs cover that
+# on a distro-packaged box, but jq often lives in a Homebrew/Linuxbrew prefix
+# instead, so append the resolved directory of any required tool the bare system
+# dirs do not already provide. FM_TEST_BASE_PATH stays an explicit override.
+fm_test_default_base_path() {
+  local base='/usr/bin:/bin:/usr/sbin:/sbin' tool resolved dir
+  for tool in jq git curl; do
+    PATH="$base" command -v "$tool" >/dev/null 2>&1 && continue
+    resolved=$(command -v "$tool" 2>/dev/null) || continue
+    dir=$(dirname "$resolved")
+    case ":$base:" in
+      *":$dir:"*) ;;
+      *) base="$base:$dir" ;;
+    esac
+  done
+  printf '%s' "$base"
+}
+
+: "${FM_TEST_BASE_PATH:=$(fm_test_default_base_path)}"
+
 # --- reporters --------------------------------------------------------------
 
 fail() {
