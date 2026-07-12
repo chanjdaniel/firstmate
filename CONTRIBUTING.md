@@ -77,6 +77,8 @@ tmp=$(mktemp -d) && printf 'done: smoke\n' > "$tmp/smoke.status" && FM_STATE_OVE
 
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so run one directly to focus on a subject.
 Tests that need a real optional backend or an explicit opt-in (real herdr/zellij/cmux smoke tests, the live Pi regression) skip themselves and print the tool or environment gate needed to enable them, so the run-all loop above is always safe.
+`tests/lib.sh` unsets any ambient `FM_HOME` so a suite run from inside a live firstmate session cannot resolve `config/` or `state/` out of your real home instead of its fixture; fixtures that need one set it per invocation.
+It also derives the system base PATH that shimming suites hand to the script under test, appending the resolved directory of any required tool (`jq`, `git`, `curl`) the bare system dirs do not provide; export `FM_TEST_BASE_PATH` to override it.
 
 ## Questions
 
