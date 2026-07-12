@@ -605,6 +605,105 @@ test_spawn_poll_rejects_transient_cwd() {
   pass "fm-spawn: poll loop rejects a transient pre-chdir path (non-git or foreign-repo) on the first read, keeps polling, and accepts the real worktree"
 }
 
+# The identity checks resolve a repository by asking git about a directory, and
+# git's lookup walks UP the tree. Projects live at $FM_HOME/projects/<name>,
+# INSIDE firstmate's own repo, so a project directory that is not a repo of its
+# own (an interrupted clone, a hand-made dir) would inherit firstmate's OWN
+# repository identity - and a pre-chdir read of firstmate's repo root would then
+# "match the project's repository", passing both the poll gate and the backstop
+# and recording firstmate's primary checkout as the crewmate's worktree.
+# The identity predicate is anchored at the git working-tree ROOT so a non-repo
+# directory has NO identity, which is what makes the refusal hold. This case is
+# built in the production shape (project nested inside the FM_ROOT repo), which
+# is what test_spawn_isolation_rejects_firstmate_paths' non-git cases - project
+# outside every repo - cannot detect.
+test_spawn_nongit_project_inside_fm_root() {
+  local home fm_root proj fakebin out status
+  fm_root=$(make_repo "$TMP_ROOT/spawn-nested-fmroot")
+  home="$fm_root"
+  # The project directory exists but is not a git repo, and it is nested inside
+  # firstmate's own repo exactly as a real projects/<name> clone would be.
+  proj="$fm_root/projects/broken-clone"
+  mkdir -p "$proj"
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-nested-fake")
+
+  # The pane reports firstmate's own repo root - the pre-chdir read of race #2.
+  mkdir -p "$home/data/nested-nongit-p8"
+  printf 'brief\n' > "$home/data/nested-nongit-p8/brief.md"
+  out=$(FM_ROOT_OVERRIDE="$fm_root" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$fm_root" TMUX="fake,1,0" \
+    FM_SPAWN_WORKTREE_TIMEOUT=3 \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" nested-nongit-p8 "$proj" codex 2>&1); status=$?
+
+  expect_code 1 "$status" "spawn must abort when a non-repo project nested in FM_ROOT would inherit firstmate's repo identity"$'\n'"$out"
+  assert_contains "$out" "not a worktree of the project repository" \
+    "nested non-git project spawn was not refused by the repo-identity backstop"
+  assert_contains "$out" "at or inside firstmate's own repo" \
+    "refusal did not name firstmate's own repo as where the tangle would have landed"
+  assert_absent "$home/state/nested-nongit-p8.meta" \
+    "refused spawn must not record meta (firstmate's own repo root as worktree=)"
+
+  pass "fm-spawn: a non-repo project nested inside FM_ROOT cannot inherit firstmate's repository identity"
+}
+
+# The poll budget is an env knob. A value that is not a positive integer makes
+# `seq 1 <bad>` empty, which would silently collapse the loop to zero iterations:
+# the poll would never read the pane at all and the spawn would die reporting an
+# unreadable pane, pointing the operator at tmux rather than at their env value.
+# A bad value must warn and fall back to the default budget instead. Driving it
+# with a pane that already sits in the real worktree keeps the case fast: a live
+# loop breaks on its first read, a collapsed one never runs.
+test_spawn_poll_timeout_knob_validation() {
+  local home proj wt fakebin out status bad id n
+  home="$TMP_ROOT/spawn-knob-home"
+  mkdir -p "$home/data"
+  proj=$(make_repo "$TMP_ROOT/spawn-knob-proj")
+  wt="$TMP_ROOT/spawn-knob-wt"
+  git -C "$proj" worktree add -q --detach "$wt" >/dev/null 2>&1
+  fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-knob-fake")
+
+  n=0
+  for bad in 0 abc 12s; do
+    n=$((n + 1))
+    id="knob-bad$n-q2"
+    mkdir -p "$home/data/$id"
+    printf 'brief\n' > "$home/data/$id/brief.md"
+    out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+      FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+      FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+      FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+      FM_SPAWN_WORKTREE_TIMEOUT="$bad" \
+      PATH="$fakebin:$PATH" \
+      "$ROOT/bin/fm-spawn.sh" "$id" "$proj" codex 2>&1); status=$?
+
+    expect_code 0 "$status" "FM_SPAWN_WORKTREE_TIMEOUT='$bad' must fall back to the default budget, not collapse the poll loop"$'\n'"$out"
+    assert_contains "$out" "ignoring FM_SPAWN_WORKTREE_TIMEOUT='$bad'" \
+      "invalid poll-timeout value '$bad' was not reported to the operator"
+    assert_contains "$out" "worktree=$wt" "poll did not run with an invalid FM_SPAWN_WORKTREE_TIMEOUT='$bad'"
+    assert_not_contains "$out" "no pane path could be read" \
+      "FM_SPAWN_WORKTREE_TIMEOUT='$bad' misreported the failure as an unreadable pane"
+  done
+
+  # A valid value is honored silently.
+  mkdir -p "$home/data/knob-ok-r3"
+  printf 'brief\n' > "$home/data/knob-ok-r3/brief.md"
+  out=$(FM_ROOT_OVERRIDE='' FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_SPAWN_WORKTREE_TIMEOUT=3 \
+    PATH="$fakebin:$PATH" \
+    "$ROOT/bin/fm-spawn.sh" knob-ok-r3 "$proj" codex 2>&1); status=$?
+  expect_code 0 "$status" "a valid FM_SPAWN_WORKTREE_TIMEOUT should spawn cleanly"$'\n'"$out"
+  assert_not_contains "$out" "ignoring FM_SPAWN_WORKTREE_TIMEOUT" \
+    "a valid FM_SPAWN_WORKTREE_TIMEOUT was wrongly rejected"
+
+  pass "fm-spawn: an invalid FM_SPAWN_WORKTREE_TIMEOUT warns and falls back to the default poll budget"
+}
+
 test_lib_classification
 test_guard_banner
 test_bootstrap_line
@@ -615,3 +714,5 @@ test_tmux_path_read_target_verification
 test_spawn_empty_wid_abort
 test_spawn_isolation_rejects_firstmate_paths
 test_spawn_poll_rejects_transient_cwd
+test_spawn_nongit_project_inside_fm_root
+test_spawn_poll_timeout_knob_validation

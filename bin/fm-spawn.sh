@@ -57,6 +57,14 @@
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the resolved task path is a real git worktree root
 #   of the PROJECT's own repository (not firstmate's repo/home or another clone), distinct from the primary checkout.
+#   That also means the project directory must itself be a git working-tree root: a
+#   directory that is not a repository of its own has no repository identity to match,
+#   so no path can be verified as a worktree of it and the spawn is refused.
+# Env: FM_SPAWN_WORKTREE_TIMEOUT overrides the worktree-discovery poll budget, in whole
+#   seconds (default 60). It bounds how long a ship/scout spawn waits for the pane to
+#   land in a genuine worktree of the project. A value that is not a positive integer is
+#   rejected with a warning and the default is used. Tests set it low to keep refusal
+#   cases fast; there is no reason to set it in normal operation.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -667,6 +675,13 @@ real_path_or_raw() {  # <path>
 # every worktree of it - a treehouse pool worktree, an Orca worktree - share one
 # common dir, so it identifies the REPOSITORY independently of where on disk the
 # worktree happens to live.
+#
+# git's lookup walks UP the tree, so <dir> inherits the identity of whatever
+# repository ENCLOSES it when <dir> is not a repository of its own. That is safe
+# only for a candidate worktree path, which validate_spawn_worktree independently
+# requires to BE its own working-tree root. For any directory that is not already
+# known to be a working-tree root - the project directory above all - use
+# git_worktree_common_dir_real instead.
 git_common_dir_real() {  # <dir>
   local dir=$1 common real
   common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 0
@@ -674,6 +689,30 @@ git_common_dir_real() {  # <dir>
   # --git-common-dir can be relative to <dir> (plain ".git" in a clone).
   real=$(cd "$dir" 2>/dev/null && cd "$common" 2>/dev/null && pwd -P) || return 0
   printf '%s\n' "$real"
+}
+
+# git_worktree_common_dir_real: like git_common_dir_real, but reports an identity
+# ONLY when <dir> is itself the ROOT of a git working tree. Empty otherwise.
+#
+# The anchor is load-bearing, not defensive noise. Because git's lookup walks UP,
+# a project directory that is not a repository of its own (an interrupted clone, a
+# hand-made directory) reports the identity of the repository that encloses it -
+# and projects live at $FM_HOME/projects/<name>, INSIDE firstmate's own repo by
+# construction. An unanchored lookup therefore hands such a project firstmate's OWN
+# repository identity, and a pre-chdir read of firstmate's repo root then "matches
+# the project's repository", passing both the discovery poll and the
+# validate_spawn_worktree backstop and recording the primary checkout as the
+# crewmate's worktree - precisely the tangle those checks exist to prevent.
+# Anchoring at the working-tree root makes a non-repo directory report NO identity,
+# which is what distinguishes "a different repository" from "no repository".
+git_worktree_common_dir_real() {  # <dir>
+  local dir=$1 top top_real dir_real
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 0
+  [ -n "$top" ] || return 0
+  top_real=$(cd "$top" 2>/dev/null && pwd -P) || return 0
+  dir_real=$(cd "$dir" 2>/dev/null && pwd -P) || return 0
+  [ "$top_real" = "$dir_real" ] || return 0
+  git_common_dir_real "$dir"
 }
 
 # Session-provider container-ensure + task creation. tmux stays exactly as P1
@@ -724,8 +763,14 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   #      this same repo-identity check to reject transient pre-chdir reads, so
   #      the loop keeps polling and this backstop should also never be reached
   #      for this race. Still checked here as defense-in-depth.
-  wt_common=$(git_common_dir_real "$WT")
-  proj_common=$(git_common_dir_real "$PROJ_ABS")
+  #
+  # An empty proj_common means the project directory is not a git working-tree
+  # root at all (an interrupted clone, a hand-made directory). It has no
+  # repository identity for a worktree to match, so nothing can be a worktree of
+  # it and the spawn is refused rather than inheriting the identity of whatever
+  # repo encloses projects/ - see git_worktree_common_dir_real.
+  wt_common=$(git_worktree_common_dir_real "$WT")
+  proj_common=$(git_worktree_common_dir_real "$PROJ_ABS")
   if [ -z "$wt_common" ] || [ -z "$proj_common" ] || [ "$wt_common" != "$proj_common" ]; then
     fm_root_real=$(cd "$FM_ROOT" 2>/dev/null && pwd -P) || fm_root_real="$FM_ROOT"
     fm_home_real=$(cd "$FM_HOME" 2>/dev/null && pwd -P) || fm_home_real="$FM_HOME"
@@ -917,8 +962,16 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
   # timing assumption about how long the pre-chdir window lasts, which is the
   # very assumption that produced the bug. A permanently wrong path simply runs
   # the loop out, and the timeout reports the last candidate and why it failed.
-  proj_common_dir=$(git_common_dir_real "$PROJ_ABS")
+  proj_common_dir=$(git_worktree_common_dir_real "$PROJ_ABS")
   wt_poll_seconds=${FM_SPAWN_WORKTREE_TIMEOUT:-60}
+  case "$wt_poll_seconds" in
+    ''|*[!0-9]*) wt_poll_valid=no ;;
+    *) [ "$wt_poll_seconds" -gt 0 ] && wt_poll_valid=yes || wt_poll_valid=no ;;
+  esac
+  if [ "$wt_poll_valid" != yes ]; then
+    echo "warning: ignoring FM_SPAWN_WORKTREE_TIMEOUT='$wt_poll_seconds' (want a positive integer number of seconds); using 60" >&2
+    wt_poll_seconds=60
+  fi
   last_p=
   last_reason=
   for _ in $(seq 1 "$wt_poll_seconds"); do
@@ -928,14 +981,20 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
         last_p=$p
         last_reason="pane never left the project clone"
       elif [ -z "$proj_common_dir" ]; then
-        # Project is not inside a git repo - fall back to the simple
-        # path-diff test. validate_spawn_worktree will catch any tangle.
+        # The project directory is not a git working-tree root, so it has no
+        # repository identity to match a candidate against and this gate cannot
+        # fire at all. Fall back to the simple path-diff test; the same empty
+        # identity makes validate_spawn_worktree refuse whatever we accept here,
+        # so nothing is recorded (git_worktree_common_dir_real).
         WT="$p"
         break
       else
         cand_common=$(git_common_dir_real "$p" || true)
         if [ -n "$cand_common" ] && [ "$cand_common" = "$proj_common_dir" ]; then
-          # Candidate is a genuine worktree of the project repository.
+          # Candidate belongs to the project's repository. It still has to BE a
+          # worktree root rather than some directory inside one; that is
+          # validate_spawn_worktree's assertion, which reports a subdirectory of
+          # the clone far more precisely than another poll timeout would.
           WT="$p"
           break
         fi

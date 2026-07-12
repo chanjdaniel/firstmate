@@ -131,7 +131,7 @@ Without further defenses the poll locks onto firstmate's own repo as the worktre
 
 ### Defenses
 
-Four defenses close both races, and they are independent on purpose:
+Five defenses close both races, and they are independent on purpose:
 
 - **Target verification in the read itself** (race #1 only).
   `fm_backend_tmux_current_path` takes an optional second argument, the expected window id.
@@ -145,13 +145,17 @@ Four defenses close both races, and they are independent on purpose:
   Before accepting a candidate path, the poll loop verifies it is a genuine git worktree belonging to the same repository as the project clone (`git rev-parse --git-common-dir` equality).
   A transient pre-chdir path (the tmux server's cwd) is not a worktree of the project, so the poll rejects it and keeps waiting.
   There is no early-accept for a path that stays wrong: any such shortcut would need a timing assumption about how long the pre-chdir window lasts, which is exactly the assumption that produced race #2.
-  A permanently wrong path therefore just runs the 60s timeout out, and the timeout error names the last candidate path and why it was rejected so the failure is diagnosable without a live pane.
-  A project that is not inside a git repo falls back to the simple path-diff test; `validate_spawn_worktree` catches any tangle in that path.
+  A permanently wrong path therefore just runs the poll budget out (60s by default; `FM_SPAWN_WORKTREE_TIMEOUT` overrides it with a positive integer number of seconds, and tests set it low to keep refusal cases fast), and the timeout error names the last candidate path and why it was rejected so the failure is diagnosable without a live pane.
+- **Repository identity is anchored at the working-tree root** (the condition that makes both identity checks sound).
+  `git rev-parse` walks UP the tree, so a directory that is not a repository of its own reports the identity of whatever repository ENCLOSES it - and projects live at `$FM_HOME/projects/<name>`, inside firstmate's own repo by construction.
+  A project directory that is not a git repo (an interrupted clone, a hand-made directory) would therefore be handed firstmate's OWN repository identity, and a pre-chdir read of firstmate's repo root would then match "the project's repository" and sail through both the poll and the backstop.
+  `git_worktree_common_dir_real` reports an identity only when the directory it is asked about is itself the ROOT of a git working tree, so a non-repo directory reports no identity at all.
+  That distinguishes "a different repository" from "no repository": a project with no repository identity has nothing that can be verified as a worktree of it, and the spawn is refused rather than tangling the primary checkout.
 - **Repository identity as the final backstop.** `fm-spawn.sh`'s `validate_spawn_worktree` requires the discovered worktree to belong to the project's own repository.
   A path belonging to a different one - firstmate's own repo or home, or another clone - aborts the spawn loudly instead of being recorded (see [`architecture.md`](architecture.md), "Worktrees, not branches in your checkout").
   This is the safety net that caught race #2 before the poll-level fix; it now serves as defense-in-depth for both races.
 
-`tests/fm-tangle-guard.test.sh` pins the defenses hermetically: the two-field target verification against matching and mismatched window ids, the empty-window-id spawn abort, the refusal of a worktree that resolves into firstmate's own repo while a pooled worktree of the project is still accepted, and the poll's rejection of a transient non-worktree path on the first read.
+`tests/fm-tangle-guard.test.sh` pins the defenses hermetically: the two-field target verification against matching and mismatched window ids, the empty-window-id spawn abort, the refusal of a worktree that resolves into firstmate's own repo while a pooled worktree of the project is still accepted, the poll's rejection of a transient non-worktree path on the first read, and the refusal of a spawn whose non-repo project directory sits inside firstmate's own repo (the identity-inheritance case above, in the production `projects/`-inside-`FM_ROOT` layout).
 
 ## Limitations
 
