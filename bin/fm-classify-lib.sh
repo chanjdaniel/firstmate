@@ -132,7 +132,11 @@ signal_reason_is_actionable() {  # <file> ...
 #             (e.g. waiting on CI);
 #   paused  - the crew's authoritative current state is a declared external-wait
 #             pause (paused:), which is EXPECTED to idle;
-#   none    - neither, so the wake must surface (a stopped/finished/parked/failed/
+#   parked  - the crew's run-step is parked at a gate (awaiting_approval or
+#             fix_review), legitimately idle while firstmate drives the validation;
+#             absorbed with a separate, longer escalatation timer so a genuinely
+#             forgotten parked run still surfaces;
+#   none    - neither, so the wake must surface (a stopped/finished/failed/
 #             torn-down/unknown crew, or an unreadable verdict).
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
 # authoritatively (not the status log) is what keeps run-step precedence: a crew
@@ -147,6 +151,7 @@ crew_absorb_class() {  # <id>
   case "$line" in state:*) ;; *) printf 'none'; return ;; esac
   state=${line#state: }; state=${state%% *}
   if [ "$state" = paused ]; then printf 'paused'; return; fi
+  if [ "$state" = parked ]; then printf 'parked'; return; fi
   if [ "$state" = working ]; then
     src=${line#*source: }; src=${src%% *}
     case "$src" in run-step|pane) printf 'working'; return ;; esac
@@ -170,6 +175,15 @@ crew_is_provably_working() {  # <id>
 # escalating a possible wedge.
 crew_is_paused() {  # <id>
   [ "$(crew_absorb_class "$1")" = paused ]
+}
+
+# 0 if crew <id>'s authoritative current state is a parked run-step
+# (awaiting_approval or fix_review). The stale path absorbs such a crew
+# (with an extended wedge timer) instead of immediately surfacing or
+# escalating a possible wedge, because a parked crew is legitimately idle
+# while firstmate drives the validation.
+crew_is_parked() {  # <id>
+  [ "$(crew_absorb_class "$1")" = parked ]
 }
 
 # 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably

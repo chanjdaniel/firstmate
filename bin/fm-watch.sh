@@ -142,6 +142,12 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
+# A crew whose no-mistakes run is parked at a gate (awaiting_approval or fix_review)
+# is legitimately idle while firstmate drives the validation, so its stale is absorbed
+# with a longer escalatation cadence than a working crew - long enough that a
+# genuinely forgotten parked run still surfaces, but only after the captain has had
+# ample time to respond. Defaults to 2x STALE_ESCALATE_SECS.
+PARKED_ESCALATE_SECS=${FM_PARKED_ESCALATE_SECS:-$(( STALE_ESCALATE_SECS * 2 ))}
 # A crew that DECLARED a pause (paused: <reason>, fm-classify-lib.sh) is idling on
 # a known external wait, so its stale pane is absorbed rather than wedge-escalated;
 # it re-surfaces once for a recheck every PAUSE_RESURFACE_SECS - far longer than the
@@ -273,8 +279,8 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
 # line that an active run/busy pane outranked).
-wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> [escalate-secs]
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 escalate_secs=${5:-$STALE_ESCALATE_SECS} since age n reason
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -283,7 +289,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
       ;;
     *)
       age=$(( $(date +%s) - since ))
-      if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+      if [ "$age" -ge "$escalate_secs" ]; then
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$escalation_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
@@ -313,7 +319,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
-  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.parkflag-$key"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
@@ -375,7 +381,7 @@ surface_nonterminal_stale() {  # <window> <hash>
   key=$(printf '%s' "$win" | tr ':/.' '___')
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
-  rm -f "$STATE/.stale-since-$key" "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key" "$STATE/.parkflag-$key"
   wake "stale: $win"
 }
 
@@ -635,6 +641,7 @@ EOF
     ssf="$STATE/.stale-since-$key"
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's current stale is a declared pause
+    pkf="$STATE/.parkflag-$key"  # flag: this key's current stale is a parked run
     prev=$(cat "$hf" 2>/dev/null || true)
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
@@ -674,23 +681,34 @@ EOF
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
+            task=$(window_to_task "$w" "$STATE")
+            if crew_is_provably_working "$task" || crew_is_parked "$task"; then
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
-              triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
+              if crew_is_parked "$task"; then
+                printf '%s' "$h" > "$pkf"
+                triage_log "absorbed stale (parked run, overriding a stale captain-relevant status): $w"
+              else
+                rm -f "$pkf"
+                triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
+              fi
             else
               fm_wake_append stale "$w" "stale: $w" || exit 1
               printf '%s' "$h" > "$sf"
-              rm -f "$ssf"
+              rm -f "$ssf" "$pkf"
               mark_surfaced "$STATE/$(window_to_task "$w" "$STATE").status"
               wake "stale: $w"
             fi
           elif [ -e "$ssf" ]; then
-            # This exact hash was already overridden as provably-working (a
-            # wedge timer is running for it) - keep treating it that way
-            # without re-reading the crew state every poll, and without
+            # This exact hash was already overridden as provably-working or
+            # parked (a wedge timer is running for it) - keep treating it that
+            # way without re-reading the crew state every poll, and without
             # letting the still-captain-relevant log line re-surface it.
-            wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf"
+            if [ -e "$pkf" ]; then
+              wedge_timer_check "$w" "$ssf" "stale (overridden terminal status, parked)" "$ewf" "$PARKED_ESCALATE_SECS"
+            else
+              wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf"
+            fi
           fi
           # else: already surfaced as genuinely terminal on a prior poll of
           # this same hash - nothing left to do (matches the original,
@@ -705,22 +723,36 @@ EOF
           #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
           #   - paused: the crew DECLARED an external wait (paused:), so absorb on the
           #     long PAUSE_RESURFACE_SECS recheck cadence instead of wedge-escalating;
-          #   - none: no running pipeline, idle pane, no busy signature, no declared
-          #     pause - the crew has STOPPED. Surface immediately so firstmate peeks
-          #     (it may be done via an interactive menu that wrote no done: status,
-          #     waiting on a decision, or wedged) instead of leaving the finish to
-          #     wait out the timer.
+           #   - parked: the crew's no-mistakes run is parked at a gate
+           #     (awaiting_approval or fix_review), legitimately idle while
+           #     firstmate drives the validation; absorb with the longer
+           #     PARKED_ESCALATE_SECS cadence so a genuinely forgotten parked
+           #     run still surfaces;
+           #   - none: no running pipeline, idle pane, no busy signature, no declared
+           #     pause - the crew has STOPPED. Surface immediately so firstmate peeks
+           #     (it may be done via an interactive menu that wrote no done: status,
+           #     waiting on a decision, or wedged) instead of leaving the finish to
+           #     wait out the timer.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
             case "$(crew_absorb_class "$task")" in
               working)
                 clear_pause_tracking "$w"
+                rm -f "$pkf"
                 printf '%s' "$h" > "$sf"
                 date +%s > "$ssf"
                 triage_log "absorbed non-terminal stale (provably working): $w"
                 ;;
               paused)
+                rm -f "$pkf"
                 handle_paused_stale "$w" "$task" "$h"
+                ;;
+              parked)
+                clear_pause_tracking "$w"
+                printf '%s' "$h" > "$sf"
+                printf '%s' "$h" > "$pkf"
+                date +%s > "$ssf"
+                triage_log "absorbed non-terminal stale (parked run): $w"
                 ;;
               *)
                 surface_nonterminal_stale "$w" "$h"
@@ -732,11 +764,14 @@ EOF
               case "$(pause_state_class "$w" "$task")" in
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$w"
+                         rm -f "$pkf"
                          printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       surface_nonterminal_stale "$w" "$h" ;;
               esac
+            elif [ -e "$pkf" ]; then
+              wedge_timer_check "$w" "$ssf" "non-terminal stale (parked)" "$ewf" "$PARKED_ESCALATE_SECS"
             else
               wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
             fi
@@ -744,7 +779,7 @@ EOF
         fi
       else
         # Pane busy or not yet stably stale: reset pending escalation bookkeeping.
-        rm -f "$ssf" "$ewf"
+        rm -f "$ssf" "$ewf" "$pkf"
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
           clear_pause_tracking "$w"
         fi
@@ -752,7 +787,7 @@ EOF
     else
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
-      rm -f "$ssf" "$ewf"
+      rm -f "$ssf" "$ewf" "$pkf"
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && ! window_is_busy "$w" "$tail40"; then
         case "$(pause_state_class "$w" "$task")" in
