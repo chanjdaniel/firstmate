@@ -32,8 +32,9 @@
 #                          closer look instead of another routine supervision
 #                          resume. Unless afk is active.
 #   check: <script>: <out> per-task check output, always actionable
-#   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
-#                          status, unless afk is active
+#   heartbeat [tasks:...]  fleet-scan backstop found unsurfaced captain-relevant
+#                          status(es); the triggering task IDs are listed when
+#                          available, unless afk is active
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -529,6 +530,14 @@ EOF
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file carries a captain-relevant verb;
+    #   - a turn-ended-only signal whose corresponding .status file on disk carries
+    #     an UNSURFACED captain-relevant line (the cross-reference blind-spot fix:
+    #     signal_reason_is_actionable inspects only .status files present in $files,
+    #     but a .turn-ended makes the task's current status relevant - a crew that
+    #     previously wrote "done: PR ... checks green" and is now monitoring for
+    #     merge produces turn-ends whose milestone would otherwise be silently
+    #     absorbed); already-surfaced lines are suppressed via .hb-surfaced-* dedup
+    #     to prevent churn;
     #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crew is
     #     NOT provably working - the crew stopped its turn with no actively-running
     #     pipeline and no busy pane, so it may be done (even via an interactive menu
@@ -539,8 +548,28 @@ EOF
     # will not re-fire, log, and keep blocking without enqueuing. The provably-working
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
     # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    crossref_actionable=0
+    # shellcheck disable=SC2086  # $files is space-separated, intentionally unquoted
+    if ! afk_present && ! signal_reason_is_actionable $files; then
+      while IFS=$(printf '\t') read -r sf sig f; do
+        [ -n "$sf" ] || continue
+        case "$f" in *.turn-ended) ;; *) continue ;; esac
+        base=${f##*/}
+        task=${base%.turn-ended}
+        statusf="$STATE/$task.status"
+        [ -e "$statusf" ] || continue
+        last=$(last_status_line "$statusf")
+        status_is_captain_relevant "$last" || continue
+        surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
+        [ "$surfaced" = "$last" ] && continue
+        crossref_actionable=1
+        break
+      done <<EOF
+$pending
+EOF
+    fi
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if afk_present || [ "$crossref_actionable" = 1 ] || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -554,6 +583,20 @@ EOF
       done <<EOF
 $pending
 EOF
+      # Also mark cross-referenced status lines as surfaced so the next turn-end
+      # does not churn-re-surface them.
+      if [ "$crossref_actionable" = 1 ]; then
+        while IFS=$(printf '\t') read -r sf sig f; do
+          [ -n "$sf" ] || continue
+          case "$f" in *.turn-ended) ;; *) continue ;; esac
+          base=${f##*/}
+          task=${base%.turn-ended}
+          statusf="$STATE/$task.status"
+          [ -e "$statusf" ] && mark_surfaced "$statusf"
+        done <<EOF
+$pending
+EOF
+      fi
       wake "$reason"
     else
       while IFS=$(printf '\t') read -r sf sig f; do
@@ -742,12 +785,25 @@ EOF
       wake "heartbeat"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.
-      # Enqueue first, then mark every captain-relevant status surfaced so the next
-      # heartbeat does not re-fire them (enqueue-before-suppress preserved).
-      fm_wake_append heartbeat heartbeat heartbeat || exit 1
+      # Build a payload carrying the task IDs whose statuses triggered the
+      # heartbeat, so firstmate can target its fleet review instead of scanning
+      # everything. Enqueue first, then mark every captain-relevant status
+      # surfaced so the next heartbeat does not re-fire them
+      # (enqueue-before-suppress preserved).
+      task_list=""
+      while IFS=$(printf '\t') read -r f task last; do
+        [ -n "$f" ] || continue
+        surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
+        [ "$surfaced" = "$last" ] && continue
+        task_list="${task_list} ${task}"
+      done < <(scan_captain_relevant_statuses "$STATE")
+      task_list=$(printf '%s' "$task_list" | sed 's/^ *//')
+      payload="heartbeat"
+      [ -n "$task_list" ] && payload="heartbeat (tasks:${task_list})"
+      fm_wake_append heartbeat heartbeat "$payload" || exit 1
       touch "$STATE/.last-heartbeat"
       mark_all_captain_relevant_surfaced
-      wake "heartbeat"
+      wake "$payload"
     else
       touch "$STATE/.last-heartbeat"
       echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"

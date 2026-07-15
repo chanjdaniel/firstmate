@@ -574,7 +574,7 @@ bin/fm-supervision-instructions.sh  # render the current harness block or one-li
 bin/fm-watch-arm.sh                 # verified arm wrapper used by harness protocols that call it
 bin/fm-watch-arm.sh --restart       # home-scoped forced restart; never a broad pkill
 bin/fm-watch-checkpoint.sh          # bounded foreground watcher checkpoint for Codex-style protocols
-bin/fm-watch.sh                     # the watcher itself; exits with: signal|stale|check|heartbeat
+bin/fm-watch.sh                     # the watcher itself; exits with: signal|stale|check|heartbeat [tasks:...]
 bin/fm-wake-drain.sh                # drain queued wake records at turn start; asserts guard after draining
 bin/fm-crew-state.sh <id>           # one-line current-state read; reconciles matching run-step, pane, and status log
 bin/fm-fleet-view.sh                # read-only Markdown whole-fleet view rendered from the structured snapshot
@@ -589,7 +589,7 @@ On wake, in order of cheapness:
    If the stale reason includes `demand-deep-inspection`, inspect the pane, `bin/fm-crew-state.sh <id>`, and the validation logs before resuming supervision.
    If the pane is waiting, looping, confused, or unresponsive, load `stuck-crewmate-recovery`.
 4. `check:` a per-task poll fired (usually a merge, or X mode when enabled); act on it.
-5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then resume the emitted supervision protocol.
+5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up". The heartbeat payload carries the specific task IDs that triggered it (e.g. `heartbeat (tasks: a b)`), so target your review on those tasks first: `bin/fm-crew-state.sh <id>` for each named task, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then resume the emitted supervision protocol. The payload is `heartbeat` alone when no task IDs were captured.
    Do not report that the fleet is unchanged.
 
 When a task reaches a terminal state on any of these wakes (a `done`/merge `check:`, a `failed` signal, a scout report, a local-only merge), and X mode is enabled, load `fmx-respond` (section 13) and post the X-mode mention's **final** completion follow-up if that task is X-mode-linked: `bin/fm-x-followup.sh --check <id>` then `bin/fm-x-followup.sh <id> --final --text-file <path>`, so the link always clears here regardless of how many of the up-to-three follow-ups were already spent on earlier milestones.
