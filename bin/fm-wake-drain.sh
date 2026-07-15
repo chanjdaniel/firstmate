@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Atomically drain durable watcher wake records, then assert watcher liveness.
+# Atomically drain durable watcher wake records, upgrade the drained tasks'
+# surfaced markers from enqueued to consumed, then assert watcher liveness.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# For the post-drain surfaced-marker upgrade: last_status_line, window_to_task,
+# and the two-state .hb-surfaced-* helpers (fm_surfaced_mark_consumed owns the
+# match-then-upgrade rule; fm-classify-lib.sh owns the marker format).
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh"
 
 DRAIN_TMP=
 DRAIN_LOCK_HELD=false
@@ -40,6 +46,54 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Post-drain hook: upgrade the two-state .hb-surfaced-* marker from enqueued to
+# consumed for every task named in the records this drain just delivered. A
+# drain that printed the records IS the proof firstmate received them, so the
+# suppression may now outlive the queue - but only while the marker's stored
+# status line still matches the status file's current last line
+# (fm_surfaced_mark_consumed owns that match-then-upgrade rule; a changed status
+# leaves the stale enqueued marker for the fresh surfacing to replace). Tasks
+# are resolved per record kind: a signal's key is the status/turn-end basename,
+# a stale's key is a window target mapped through the task metadata, and a
+# heartbeat's payload carries its "(tasks:...)" list. Best-effort and
+# idempotent: a marker hiccup must never fail or re-queue the drain.
+upgrade_surfaced_markers() {  # <drained-queue-file>
+  local drained=$1 tasks="" seen="" epoch seq kind key payload task
+  [ -s "$drained" ] || return 0
+  while IFS=$(printf '\t') read -r epoch seq kind key payload; do
+    [ -n "${kind:-}" ] || continue
+    task=""
+    case "$kind" in
+      signal)
+        case "$key" in
+          *.status) task=${key%.status} ;;
+          *.turn-ended) task=${key%.turn-ended} ;;
+        esac
+        [ -n "$task" ] && tasks="$tasks $task"
+        ;;
+      stale)
+        task=$(window_to_task "$key" "$STATE")
+        [ -n "$task" ] && tasks="$tasks $task"
+        ;;
+      heartbeat)
+        case "$payload" in
+          *"(tasks:"*)
+            payload=${payload#*"(tasks:"}
+            payload=${payload%%")"*}
+            tasks="$tasks $payload"
+            ;;
+        esac
+        ;;
+    esac
+  done < "$drained"
+  for task in $tasks; do
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    fm_surfaced_mark_consumed "$STATE" "$task" || true
+  done
+  return 0
+}
+
 fm_lock_acquire_wait "$FM_WAKE_QUEUE_LOCK"
 DRAIN_LOCK_HELD=true
 
@@ -55,6 +109,7 @@ mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
 : > "$FM_WAKE_QUEUE" || exit 1
 
 fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
+upgrade_surfaced_markers "$DRAIN_TMP"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=
 assert_watcher_liveness

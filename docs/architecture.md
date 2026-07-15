@@ -20,6 +20,8 @@ Fresh stale panes use the same current-state read before trusting the status log
 No-change heartbeats are also benign.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 After each drain, `fm-wake-drain.sh` runs the same liveness guard as the supervision scripts, so a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
+The `.hb-surfaced-*` suppression marker is two-state: the watcher writes `enqueued:<line>` when it queues a surfacing wake, and `fm-wake-drain.sh` upgrades it to `consumed:<line>` after delivering that record, but only while the stored line still matches the status file's current last line.
+Both phases suppress re-surfacing, yet a surfacing wake lost without a proper drain leaves the marker enqueued with its record still queued, so the status still reaches the first mate instead of being stamped surfaced-forever with nothing in the queue; `bin/fm-classify-lib.sh`'s surfaced-marker helpers own the format.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
 Crew status files are append-only wake-event logs, not current-state fields.

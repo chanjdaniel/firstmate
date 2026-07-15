@@ -13,13 +13,15 @@
 # daemon keeps its escalation-digest seen-markers; the watcher keeps its .seen-*
 # signatures).
 #
-# The one exception is the absorb classification (crew_absorb_class and its
-# working/paused wrappers). It is NOT a pure status-file read: it reuses
+# Two exceptions are not pure reads. The absorb classification
+# (crew_absorb_class and its working/paused wrappers) reuses
 # bin/fm-crew-state.sh, which may make a bounded no-mistakes call, to decide
 # whether a crew that just stopped its turn or went stale is working, deliberately
 # paused, or neither. Callers run it ONLY on no-verb signal handling and first
 # sighting of a stale hash, never on every wake, so the per-wake triage stays
-# cheap.
+# cheap. The surfaced-marker helpers at the bottom of this file write the
+# .hb-surfaced-<task> marker files shared by the watcher's enqueue paths and
+# fm-wake-drain.sh's post-drain consume upgrade.
 
 # Directory of this library, used to locate the sibling fm-crew-state.sh reader.
 # Resolved at source time from BASH_SOURCE so it works whether sourced by a
@@ -234,4 +236,64 @@ scan_captain_relevant_statuses() {  # <state>
     printf '%s\t%s\t%s\n' "$f" "$task" "$last"
   done
   return 0
+}
+
+# --- two-state surfaced marker (.hb-surfaced-<task>) --------------------------
+#
+# THE one owner of the marker's on-disk format; every reader and writer goes
+# through these helpers. state/.hb-surfaced-<task> records the captain-relevant
+# status line the watcher surfaced (woke firstmate for), in one of two phases:
+#   enqueued:<status-line>  written at wake-ENQUEUE time (fm-watch.sh's
+#                           mark_surfaced / mark_all_captain_relevant_surfaced),
+#                           meaning the record carrying this line is in the
+#                           durable queue or already drained;
+#   consumed:<status-line>  upgraded by bin/fm-wake-drain.sh AFTER the record was
+#                           provably drained (delivered to firstmate) while the
+#                           line was still the status file's current last line.
+# Suppression (fm_surfaced_line_is_surfaced) treats BOTH phases as
+# already-surfaced: an enqueued line's record is in the queue or drained, so
+# firstmate will see it, and a consumed line was demonstrably delivered. The
+# two-state split exists for the failure path: if a surfacing wake is lost
+# without a proper drain, the marker stays enqueued and the record stays in the
+# durable queue, so the two together still reach firstmate instead of the line
+# being stamped surfaced-forever with nothing queued. A marker for a DIFFERENT
+# line than the current one - enqueued or consumed - never suppresses: a fresh
+# captain-relevant status re-surfaces and rewrites the marker. Legacy
+# single-state markers (a bare status line, pre-two-state) intentionally do NOT
+# match either phase: whether they were ever consumed is unknowable, so they
+# fail open and re-surface once, after which the two-state cycle owns them.
+
+fm_surfaced_marker_path() {  # <state> <task>
+  printf '%s/.hb-surfaced-%s' "$1" "$(printf '%s' "$2" | tr ':/.' '___')"
+}
+
+# Record <status-line> as enqueued-surfaced for <task>. Call only AFTER the wake
+# carrying the line is in the durable queue (enqueue-before-suppress).
+fm_surfaced_mark_enqueued() {  # <state> <task> <status-line>
+  printf 'enqueued:%s' "$3" > "$(fm_surfaced_marker_path "$1" "$2")"
+}
+
+# 0 if <status-line> is already surfaced for <task> (enqueued or consumed);
+# 1 for an absent marker, a different line, or a legacy bare-format marker.
+fm_surfaced_line_is_surfaced() {  # <state> <task> <status-line>
+  local marker
+  marker=$(cat "$(fm_surfaced_marker_path "$1" "$2")" 2>/dev/null || true)
+  [ "$marker" = "enqueued:$3" ] || [ "$marker" = "consumed:$3" ]
+}
+
+# Upgrade <task>'s marker from enqueued to consumed, but ONLY when the stored
+# status line still matches the status file's current last line - if the status
+# changed between enqueue and drain, the stale enqueued marker is left untouched
+# for the fresh surfacing to replace. Idempotent (a consumed or absent marker is
+# a no-op) and never blocks on a missing status file (last_status_line returns
+# empty, which cannot match a non-empty stored line).
+fm_surfaced_mark_consumed() {  # <state> <task>
+  local state=$1 task=$2 mf marker stored current
+  mf=$(fm_surfaced_marker_path "$state" "$task")
+  marker=$(cat "$mf" 2>/dev/null || true)
+  case "$marker" in enqueued:*) ;; *) return 0 ;; esac
+  stored=${marker#enqueued:}
+  current=$(last_status_line "$state/$task.status")
+  [ "$current" = "$stored" ] || return 0
+  printf 'consumed:%s' "$stored" > "$mf"
 }
