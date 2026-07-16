@@ -12,6 +12,7 @@
 # Watcher-side enqueue triage lives in fm-watch-triage.test.sh; the turn-end
 # cross-reference and heartbeat payload in fm-watch-surface-scout.test.sh.
 # Tests run in subshells so failures in one do not stop the runner.
+# shellcheck disable=SC2317  # info: fail() exits; newer shellcheck flags post-fi code as unreachable
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
@@ -168,8 +169,7 @@ test_enqueued_marker_suppresses_duplicate_surfacing() {
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 "$WATCH" > "$out" &
   pid=$!
   if ! wait_live "$pid" 30; then
-    reap "$pid"
-    fail "heartbeat re-fired for a line whose enqueued marker is current (should absorb): $(cat "$out")"
+    reap "$pid"; fail "heartbeat re-fired for a line whose enqueued marker is current (should absorb): $(cat "$out")"
   fi
   [ ! -s "$out" ] || { reap "$pid"; fail "suppressed heartbeat printed a wake reason: $(cat "$out")"; }
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "suppressed heartbeat enqueued a duplicate record"; }
