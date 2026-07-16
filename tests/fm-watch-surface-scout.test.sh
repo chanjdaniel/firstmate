@@ -22,6 +22,7 @@
 # These tests are designed to FAIL (confirming the bug) in the current codebase
 # and PASS once the fix is applied. Each test runs in a subshell so the runner
 # continues through all of them.
+# shellcheck disable=SC2317  # info: fail() exits; newer shellcheck flags post-fi code as unreachable in array-dispatched tests
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
