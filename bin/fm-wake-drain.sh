@@ -58,9 +58,9 @@ trap 'exit 143' TERM
 # heartbeat's payload carries its "(tasks:...)" list. Best-effort and
 # idempotent: a marker hiccup must never fail or re-queue the drain.
 upgrade_surfaced_markers() {  # <drained-queue-file>
-  local drained=$1 tasks="" seen="" epoch seq kind key payload task
+  local drained=$1 tasks="" seen="" kind key payload task
   [ -s "$drained" ] || return 0
-  while IFS=$(printf '\t') read -r epoch seq kind key payload; do
+  while IFS=$(printf '\t') read -r _ _ kind key payload; do
     [ -n "${kind:-}" ] || continue
     task=""
     case "$kind" in
