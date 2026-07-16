@@ -108,8 +108,12 @@ rm -f "$DRAIN_TMP"
 mv "$FM_WAKE_QUEUE" "$DRAIN_TMP" || exit 1
 : > "$FM_WAKE_QUEUE" || exit 1
 
-fm_wake_print_deduped "$DRAIN_TMP" || exit "$?"
-upgrade_surfaced_markers "$DRAIN_TMP"
+DEDUPED_TMP="$STATE/.wake-queue.deduped.$(fm_current_pid)"
+rm -f "$DEDUPED_TMP"
+fm_wake_print_deduped "$DRAIN_TMP" > "$DEDUPED_TMP" || exit "$?"
+cat "$DEDUPED_TMP" || exit "$?"
+upgrade_surfaced_markers "$DEDUPED_TMP"
+rm -f "$DEDUPED_TMP"
 rm -f "$DRAIN_TMP"
 DRAIN_TMP=
 assert_watcher_liveness
