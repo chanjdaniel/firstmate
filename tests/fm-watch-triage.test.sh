@@ -991,8 +991,8 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
   pid=$!
   wait_for_exit "$pid" 40 || fail "heartbeat backstop did not surface an unsurfaced captain-relevant status"
   grep -F "heartbeat" "$out" >/dev/null || fail "backstop did not exit with a heartbeat wake"
-  [ "$(cat "$state/.hb-surfaced-miss" 2>/dev/null || true)" = "done: PR https://example.test/pr/5" ] \
-    || fail "backstop did not record the status as surfaced (would re-fire next heartbeat)"
+  [ "$(cat "$state/.hb-surfaced-miss" 2>/dev/null || true)" = "enqueued:done: PR https://example.test/pr/5" ] \
+    || fail "backstop did not record the status as enqueued-surfaced (would re-fire next heartbeat)"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the backstop heartbeat failed"
   grep "$(printf '\theartbeat\t')" "$drain_out" >/dev/null || fail "backstop heartbeat was not queued"
   pass "heartbeat backstop fail-safe surfaces a captain-relevant status the per-wake path missed"

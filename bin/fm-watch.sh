@@ -436,45 +436,53 @@ run_check() {
 # surface and absorb), .hb-surfaced is advanced ONLY on surface, so the heartbeat
 # fleet-scan can tell apart a captain-relevant status that already woke firstmate
 # from one that has not - the latter being a per-wake-path miss it must surface.
-_hb_surfaced_path() { printf '%s/.hb-surfaced-%s' "$STATE" "$(printf '%s' "$1" | tr ':/.' '___')"; }
+# The marker is TWO-STATE (enqueued:<line> / consumed:<line>); its on-disk format
+# and helpers are owned by fm-classify-lib.sh's surfaced-marker section. This
+# watcher writes only the enqueued phase; bin/fm-wake-drain.sh owns the
+# enqueued->consumed upgrade after a provable drain.
 
-# Record a status file's captain-relevant last line as surfaced (no-op for a
-# non-captain-relevant or empty status). Call AFTER the wake is enqueued, so the
-# enqueue-before-suppress ordering holds for this marker too.
+# Record a status file's captain-relevant last line as enqueued-surfaced (no-op
+# for a non-captain-relevant or empty status). Call AFTER the wake is enqueued,
+# so the enqueue-before-suppress ordering holds for this marker too: the marker
+# then reads enqueued:<line> while the record sits in the durable queue, and
+# bin/fm-wake-drain.sh upgrades it to consumed:<line> once the record is
+# provably delivered with the line still current.
 mark_surfaced() {  # <status-file>
   local f=$1 task last
   task=$(basename "$f"); task="${task%.status}"
   last=$(last_status_line "$f")
   [ -n "$last" ] || return 0
   status_is_captain_relevant "$last" || return 0
-  printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
+  fm_surfaced_mark_enqueued "$STATE" "$task" "$last"
 }
 
-# Mark every current captain-relevant status as surfaced. Called after the
-# heartbeat backstop enqueues its wake, so the same statuses are not re-surfaced
-# by the next heartbeat.
+# Mark every current captain-relevant status as enqueued-surfaced. Called after
+# the heartbeat backstop enqueues its wake, so the same statuses are not
+# re-surfaced by the next heartbeat; the enqueued phase and its drain-time
+# consumed upgrade behave exactly as in mark_surfaced above.
 mark_all_captain_relevant_surfaced() {
   local f task last
   while IFS=$(printf '\t') read -r f task last; do
     [ -n "$f" ] || continue
-    printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
+    fm_surfaced_mark_enqueued "$STATE" "$task" "$last"
   done < <(scan_captain_relevant_statuses "$STATE")
 }
 
 # Cheap heartbeat fleet-scan (the always-on twin of the daemon's catch-all). 0 if
 # any captain-relevant status has NOT already been surfaced to firstmate (its
-# content differs from the .hb-surfaced-<task> marker). Pure detect, no side
-# effects: the caller enqueues first, then marks surfaced. Because every
-# captain-relevant signal/stale already marks itself surfaced when it wakes
-# firstmate, this normally finds nothing and the heartbeat is absorbed; it
-# surfaces only a captain-relevant status the per-wake path absorbed by mistake -
-# the fail-safe backstop.
+# content matches neither phase of the two-state .hb-surfaced-<task> marker;
+# fm_surfaced_line_is_surfaced). Pure detect, no side effects: the caller
+# enqueues first, then marks surfaced. Because every captain-relevant
+# signal/stale already marks itself surfaced when it wakes firstmate, this
+# normally finds nothing and the heartbeat is absorbed; it surfaces only a
+# captain-relevant status the per-wake path absorbed by mistake - the fail-safe
+# backstop. A lost surfacing wake leaves its marker enqueued with its record
+# still queued, so the drain path (not this scan) still delivers it.
 heartbeat_scan_finds_actionable() {
-  local f task last surfaced
+  local f task last
   while IFS=$(printf '\t') read -r f task last; do
     [ -n "$f" ] || continue
-    surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
-    [ "$surfaced" = "$last" ] && continue
+    fm_surfaced_line_is_surfaced "$STATE" "$task" "$last" && continue
     return 0
   done < <(scan_captain_relevant_statuses "$STATE")
   return 1
@@ -566,8 +574,7 @@ EOF
         [ -e "$statusf" ] || continue
         last=$(last_status_line "$statusf")
         status_is_captain_relevant "$last" || continue
-        surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
-        [ "$surfaced" = "$last" ] && continue
+        fm_surfaced_line_is_surfaced "$STATE" "$task" "$last" && continue
         crossref_actionable=1
         break
       done <<EOF
@@ -828,8 +835,7 @@ EOF
       task_list=""
       while IFS=$(printf '\t') read -r f task last; do
         [ -n "$f" ] || continue
-        surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
-        [ "$surfaced" = "$last" ] && continue
+        fm_surfaced_line_is_surfaced "$STATE" "$task" "$last" && continue
         task_list="${task_list} ${task}"
       done < <(scan_captain_relevant_statuses "$STATE")
       task_list=$(printf '%s' "$task_list" | sed 's/^ *//')
