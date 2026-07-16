@@ -34,6 +34,13 @@ DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-watch-surface-scout-tests)   # consumed by make_case via wake-helpers.sh
 
+# The runner dispatches test functions indirectly (run_test "$t"), which
+# ShellCheck cannot see through, so its reachability analysis flags the test
+# functions and the helpers they call as never invoked: SC2329 on newer
+# versions, SC2317 (per body command) on the older version CI runs.
+# Each such function carries a targeted disable for both codes.
+
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 watch_bg() {
   local state=$1 fakebin=$2 out=$3
   shift 3
@@ -41,6 +48,7 @@ watch_bg() {
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH" > "$out" &
 }
 
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 wait_live() {
   local pid=$1 limit=${2:-30} i=0
   while [ "$i" -lt "$limit" ]; do
@@ -51,6 +59,7 @@ wait_live() {
   return 0
 }
 
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 wait_for_exit() {
   local pid=$1 limit=${2:-50} i=0
   while [ "$i" -lt "$limit" ]; do
@@ -66,8 +75,10 @@ wait_for_exit() {
   return 124
 }
 
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
 
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 seen_sig() {
   if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
 }
@@ -89,6 +100,7 @@ run_test() {
 # DEFECT 1: Blind spot - turn-end absorbed despite captain-relevant status
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_defect1_blind_spot() {
   local dir state fakebin out status_file sig pid
   dir=$(make_case d1-blind); state="$dir/state"; fakebin="$dir/fakebin"
@@ -131,6 +143,7 @@ test_defect1_blind_spot() {
 # captain-relevant statuses ON DISK for the same task.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_defect1_sria_blind_to_disk() {
   local dir state last
   dir=$(make_case d1-sria); state="$dir/state"
@@ -157,6 +170,7 @@ test_defect1_sria_blind_to_disk() {
 # is correct (the status was already surfaced in Phase A).
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_defect2_hb_marks_too_early() {
   local dir state fakebin out sig pid
   dir=$(make_case d2-hb-early); state="$dir/state"; fakebin="$dir/fakebin"
@@ -204,6 +218,7 @@ test_defect2_hb_marks_too_early() {
 # After the fix, it lists the task IDs whose statuses triggered the heartbeat.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_defect2_hb_payload_has_task_identity() {
   local dir state fakebin out drain_out sig pid
   dir=$(make_case d2-hb-payload); state="$dir/state"; fakebin="$dir/fakebin"
@@ -235,6 +250,7 @@ test_defect2_hb_payload_has_task_identity() {
 # .status files (the design intent), so callers must compensate.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_signal_reason_is_actionable_filters_only_status_files() {
   local dir state
   dir=$(make_case d1-filter); state="$dir/state"
