@@ -22,6 +22,7 @@ set -u
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
+# shellcheck disable=SC2034 # consumed by make_case via wake-helpers.sh
 TMP_ROOT=$(fm_test_tmproot fm-watch-surfaced-marker-tests)
 
 watch_bg() {
@@ -56,6 +57,7 @@ run_test() {
 # phase, prefixed with the exact status line it queued.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Called indirectly through run_test via the tests array.
 test_marker_written_as_enqueued_at_enqueue() {
   local dir state fakebin out status_file line pid
   dir=$(make_case enq-at-enqueue); state="$dir/state"; fakebin="$dir/fakebin"
@@ -77,6 +79,7 @@ test_marker_written_as_enqueued_at_enqueue() {
 # consumed:<line> when the status file is unchanged.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Called indirectly through run_test via the tests array.
 test_drain_upgrades_enqueued_to_consumed() {
   local dir state fakebin out drain_out status_file line pid
   dir=$(make_case drain-upgrades); state="$dir/state"; fakebin="$dir/fakebin"
@@ -100,6 +103,7 @@ test_drain_upgrades_enqueued_to_consumed() {
 # the stale enqueued marker is left alone for the fresh surfacing to replace.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Called indirectly through run_test via the tests array.
 test_drain_leaves_stale_enqueued_marker_untouched() {
   local dir state fakebin out drain_out status_file old_line pid
   dir=$(make_case stale-untouched); state="$dir/state"; fakebin="$dir/fakebin"
@@ -125,6 +129,7 @@ test_drain_leaves_stale_enqueued_marker_untouched() {
 # heartbeat backstop exactly as if no marker existed.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Called indirectly through run_test via the tests array.
 test_consumed_marker_for_old_line_resurfaces_like_absent() {
   local dir state fakebin out sig pid
   dir=$(make_case consumed-resurface); state="$dir/state"; fakebin="$dir/fakebin"
@@ -150,6 +155,7 @@ test_consumed_marker_for_old_line_resurfaces_like_absent() {
 # backstop absorbs instead of re-firing a duplicate wake.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Called indirectly through run_test via the tests array.
 test_enqueued_marker_suppresses_duplicate_surfacing() {
   local dir state fakebin out line sig pid
   dir=$(make_case enq-suppresses); state="$dir/state"; fakebin="$dir/fakebin"
