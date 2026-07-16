@@ -19,6 +19,7 @@ set -u
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
+# shellcheck disable=SC2034 # Consumed by make_case via wake-helpers.sh
 TMP_ROOT=$(fm_test_tmproot fm-watch-parked-absorb-tests)
 
 # The runner dispatches test functions indirectly (run_test "$t"), which
