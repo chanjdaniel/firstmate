@@ -19,15 +19,16 @@ set -u
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
+# shellcheck disable=SC2034 # Consumed by make_case via wake-helpers.sh
 TMP_ROOT=$(fm_test_tmproot fm-watch-parked-absorb-tests)
 
-watch_bg() {
-  local state=$1 fakebin=$2 out=$3
-  shift 3
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH" > "$out" &
-}
+# The runner dispatches test functions indirectly (run_test "$t"), which
+# ShellCheck cannot see through, so its reachability analysis flags the test
+# functions and the helpers they call as never invoked: SC2329 on newer
+# versions, SC2317 (per body command) on the older version CI runs.
+# Each such function carries a targeted disable for both codes.
 
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 wait_live() {
   local pid=$1 limit=${2:-30} i=0
   while [ "$i" -lt "$limit" ]; do
@@ -38,6 +39,7 @@ wait_live() {
   return 0
 }
 
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 wait_for_exit() {
   local pid=$1 limit=${2:-50} i=0
   while [ "$i" -lt "$limit" ]; do
@@ -53,8 +55,10 @@ wait_for_exit() {
   return 124
 }
 
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
 
+# shellcheck disable=SC2317,SC2329 # Invoked only from indirectly-dispatched tests; see note above.
 seen_sig() {
   if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
 }
@@ -74,6 +78,7 @@ run_test() {
 # Test 1: crew_absorb_class returns parked for a parked run-step.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_absorb_class_returns_parked_for_parked_run_step() {
   local dir fakebin
   dir=$(make_case absorb-parked1); fakebin="$dir/fakebin"
@@ -92,6 +97,7 @@ test_absorb_class_returns_parked_for_parked_run_step() {
 # Test 2: crew_absorb_class returns parked for a parked run with ask-user.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_absorb_class_returns_parked_for_ask_user_gate() {
   local dir fakebin
   dir=$(make_case absorb-parked2); fakebin="$dir/fakebin"
@@ -108,6 +114,7 @@ test_absorb_class_returns_parked_for_ask_user_gate() {
 # Test 3: Parked crew does NOT trip stale on new hash (absorbed).
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_parked_crew_absorbed_on_new_hash() {
   local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case parked-absorb-newhash); state="$dir/state"; fakebin="$dir/fakebin"
@@ -145,6 +152,7 @@ test_parked_crew_absorbed_on_new_hash() {
 # Test 4: Parked crew's wedge timer escalates past PARKED_ESCALATE_SECS.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_parked_crew_wedge_escalates_past_parked_threshold() {
   local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case parked-escalate); state="$dir/state"; fakebin="$dir/fakebin"
@@ -180,6 +188,7 @@ test_parked_crew_wedge_escalates_past_parked_threshold() {
 #   captain-relevant line) and start the parked wedge timer.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_parked_overrides_stale_terminal_status() {
   local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case parked-override); state="$dir/state"; fakebin="$dir/fakebin"
@@ -223,6 +232,7 @@ test_parked_overrides_stale_terminal_status() {
 #   the stale terminal status must still surface immediately.
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2317,SC2329 # Dispatched indirectly via run_test "$t"; see note above.
 test_nonparked_crew_with_terminal_status_surfaces() {
   local dir state fakebin out drain_out capture_file window key pane_hash sig pid
   dir=$(make_case nonparked-surfaces); state="$dir/state"; fakebin="$dir/fakebin"
